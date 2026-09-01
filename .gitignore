@@ -1,0 +1,12 @@
+# never leave this machine
+data/*.db
+data/*.db-*
+data/*.bak_*
+data/alcopa_token.txt
+data/_captcha.png
+data/qa/
+data/photos/
+data/saved/
+*.log
+__pycache__/
+*.pyc
