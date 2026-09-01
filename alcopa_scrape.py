@@ -157,28 +157,58 @@ def _mint_playwright() -> str | None:
         ctx = browser.new_context(user_agent=UA, locale="fr-FR",
                                   viewport={"width": 1280, "height": 900})
         page = ctx.new_page()
+        v = os.environ.get("ALCOPA_DEBUG") == "1"
+
+        def log(msg: str) -> None:
+            if v:
+                print(f"  [mint] {msg}", flush=True)
+
+        def dump(tag: str) -> None:
+            """Leave evidence behind — a failure on a server we cannot watch
+            is otherwise just 'mint failed' four times with no cause."""
+            if not v:
+                return
+            try:
+                DATA.mkdir(parents=True, exist_ok=True)
+                page.screenshot(path=str(DATA / f"_mint_{tag}.png"), full_page=True)
+                (DATA / f"_mint_{tag}.html").write_text(page.content()[:200000],
+                                                        encoding="utf-8")
+            except Exception:
+                pass
+
         try:
             page.goto(BASE + "/", timeout=60000, wait_until="domcontentloaded")
             page.wait_for_timeout(3500)
+            log(f"loaded, title={page.title()!r}")
             btn = page.query_selector("#amzn-captcha-verify-button")
+            log(f"begin button: {'found' if btn else 'ABSENT'}")
             if btn:
                 btn.click()
                 page.wait_for_timeout(3000)
             instr = page.evaluate(
                 "() => (document.body.innerText.match(/Choose all[^\\n]*/)||['?'])[0]")
+            log(f"instruction: {instr!r}")
             canvas = page.query_selector("canvas")
             if not canvas:
+                log("NO CANVAS — the captcha grid never rendered")
+                dump("nocanvas")
                 return None
             canvas.screenshot(path=str(png))
             tiles = _solve_grid(instr, png)
+            log(f"model returned tiles: {tiles}")
             if not tiles:
+                dump("notiles")
                 return None
-            page.evaluate(TILE_CLICK_JS, tiles)
+            clicked = page.evaluate(TILE_CLICK_JS, tiles)
+            log(f"tiles clicked: {clicked}")
             page.click("#amzn-btn-verify-internal")
             page.wait_for_timeout(5000)
             for c in ctx.cookies():
                 if c["name"] == "aws-waf-token" and len(c["value"]) > 100:
+                    log(f"token minted, len={len(c['value'])}")
                     return c["value"]
+            log("verified but NO usable token cookie")
+            dump("notoken")
             return None
         finally:
             ctx.close()
