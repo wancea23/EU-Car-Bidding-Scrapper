@@ -63,7 +63,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: mint-debug-${{ github.run_id }}
-          path: data/_mint_*
+          path: |
+            data/_mint_*
+            data/_captcha.png
           if-no-files-found: ignore
           retention-days: 7
 

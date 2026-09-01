@@ -213,7 +213,33 @@ def _mint_playwright() -> str | None:
                 log("NO CANVAS — the captcha grid never rendered")
                 dump("nocanvas")
                 return None
+            # The nine tiles are painted into the canvas asynchronously. On a
+            # fast local machine they are there by the time we look; on a cold
+            # runner they are not, and screenshotting early hands the model a
+            # blank square — which still returns five confident tile numbers.
+            # Wait until the canvas actually has variation in it.
+            try:
+                page.wait_for_function(
+                    """() => {
+                        const c = document.querySelector('canvas');
+                        if (!c || !c.width) return false;
+                        const g = c.getContext('2d');
+                        const d = g.getImageData(0, 0, c.width, c.height).data;
+                        let mn = 255, mx = 0;
+                        for (let i = 0; i < d.length; i += 400) {
+                            if (d[i] < mn) mn = d[i];
+                            if (d[i] > mx) mx = d[i];
+                        }
+                        return (mx - mn) > 40;   // not a flat blank square
+                    }""", timeout=15000)
+                log("canvas painted")
+            except Exception:
+                log("canvas still looks blank after 15s — solving anyway")
+            page.wait_for_timeout(600)
             canvas.screenshot(path=str(png))
+            if v:
+                import shutil
+                shutil.copyfile(png, DATA / f"_mint_grid_{int(time.time())}.png")
             tiles = _solve_grid(instr, png)
             log(f"model returned tiles: {tiles}")
             if not tiles:
@@ -223,11 +249,18 @@ def _mint_playwright() -> str | None:
             log(f"tiles clicked: {clicked}")
             page.click("#amzn-btn-verify-internal")
             page.wait_for_timeout(5000)
+            # A cookie exists both before and after a solve, so its presence
+            # proves nothing — check it against the site before calling this a
+            # success, or a wrong answer looks like a network failure.
             for c in ctx.cookies():
                 if c["name"] == "aws-waf-token" and len(c["value"]) > 100:
-                    log(f"token minted, len={len(c['value'])}")
-                    return c["value"]
-            log("verified but NO usable token cookie")
+                    if _token_alive(c["value"]):
+                        log(f"token minted and verified, len={len(c['value'])}")
+                        return c["value"]
+                    log("solve REJECTED — tiles were wrong")
+                    dump("rejected")
+                    return None
+            log("no usable token cookie at all")
             dump("notoken")
             return None
         finally:
