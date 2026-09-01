@@ -10,3 +10,5 @@ data/saved/
 *.log
 __pycache__/
 *.pyc
+art/
+*.zip
