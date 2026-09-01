@@ -279,6 +279,11 @@ def _mint() -> str | None:
                 return tok
         except Exception as e:                     # noqa: BLE001
             print(f"  [waf] playwright mint failed: {str(e)[:120]}")
+        # Falling through to agent-browser only makes sense on a workstation
+        # that has it. On a server the fallback just raises a confusing
+        # "not on PATH" that buries the real reason the mint failed.
+        if os.environ.get("CI") or not os.environ.get("LOCALAPPDATA"):
+            return None
     _ab("open", BASE + "/", timeout=180)
     time.sleep(4)
     _ab("click", "#amzn-captcha-verify-button")
