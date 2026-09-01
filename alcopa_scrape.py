@@ -154,7 +154,12 @@ def _mint_playwright() -> str | None:
         browser = pw.chromium.launch(
             headless=os.environ.get("ALCOPA_HEADFUL") != "1",
             args=["--disable-blink-features=AutomationControlled"])
-        ctx = browser.new_context(user_agent=UA, locale="fr-FR",
+        # Ask for English explicitly. The WAF localises its captcha to the
+        # browser locale, and a French "Choisissez tous les ..." made the
+        # instruction unreadable to the extractor below — the model then got
+        # "?" and guessed nine tiles blind, every single time.
+        ctx = browser.new_context(user_agent=UA, locale="en-US",
+                                  extra_http_headers={"Accept-Language": "en-US,en;q=0.9"},
                                   viewport={"width": 1280, "height": 900})
         page = ctx.new_page()
         v = os.environ.get("ALCOPA_DEBUG") == "1"
@@ -185,9 +190,24 @@ def _mint_playwright() -> str | None:
             if btn:
                 btn.click()
                 page.wait_for_timeout(3000)
-            instr = page.evaluate(
-                "() => (document.body.innerText.match(/Choose all[^\\n]*/)||['?'])[0]")
+            # Belt and braces: match the instruction in whatever language the
+            # WAF decided to serve, and never hand the model a bare "?" — a
+            # blind guess wastes a solve and looks like a network failure.
+            instr = page.evaluate("""() => {
+                const t = document.body.innerText;
+                const pats = [/Choose all[^\\n]*/i, /Choisissez tou[^\\n]*/i,
+                              /Selecciona[^\\n]*/i, /W[aä]hle[^\\n]*/i,
+                              /Seleziona[^\\n]*/i, /Kies alle[^\\n]*/i];
+                for (const p of pats) { const m = t.match(p); if (m) return m[0]; }
+                const line = t.split('\\n').map(s => s.trim())
+                    .find(s => s.length > 8 && s.length < 90 && !/human|robot|spam/i.test(s));
+                return line || '';
+            }""")
             log(f"instruction: {instr!r}")
+            if not instr or instr == "?":
+                log("instruction unreadable — refusing to guess")
+                dump("noinstruction")
+                return None
             canvas = page.query_selector("canvas")
             if not canvas:
                 log("NO CANVAS — the captcha grid never rendered")
