@@ -2,17 +2,15 @@
 # Provision a fresh Linux box (Oracle Always Free, or any VPS) as the Alcopa
 # deadline watcher. Idempotent: safe to re-run.
 #
-#   scp -i ~/.ssh/oracle_alcopa alcopa_scrape.py vpauto_scrape.py ubuntu@IP:~/
-#   scp -i ~/.ssh/oracle_alcopa -r deploy ubuntu@IP:~/
-#   ssh -i ~/.ssh/oracle_alcopa ubuntu@IP 'bash deploy/provision.sh <GEMINI_API_KEY>'
+#   ssh ubuntu@IP 'curl -fsSL <raw-url>/deploy/provision.sh | bash -s <GEMINI_API_KEY>'
 #
-# Deliberately does NOT `git clone`: the GitHub copy predates the MINT_LEAD fix
-# and still bakes a watch list into the image, so a clone would deploy a
-# watcher that captures nothing and reports success.
+# Updates are then just `cd /opt/alcopa && git pull` — which is the whole
+# reason this clones rather than copying files up by hand.
 set -euo pipefail
 
 KEY="${1:?usage: provision.sh <GEMINI_API_KEY>}"
 APP=/opt/alcopa
+REPO=https://github.com/wancea23/EU-Car-Bidding-Scrapper.git
 
 # ---------------------------------------------------------------- preflight
 # The single question that decides whether this host is usable at all.
@@ -58,10 +56,24 @@ fi
 
 # ---------------------------------------------------------------- the app
 echo "== app -> $APP"
-sudo mkdir -p "$APP/data"
-sudo cp ~/alcopa_scrape.py ~/vpauto_scrape.py "$APP/"
-sudo cp -r ~/deploy "$APP/"
-sudo chown -R "$USER":"$USER" "$APP"
+sudo apt-get install -y -qq git >/dev/null
+if [ -d "$APP/.git" ]; then
+  git -C "$APP" pull --ff-only
+else
+  sudo mkdir -p "$APP"; sudo chown -R "$USER":"$USER" "$APP"
+  git clone -q "$REPO" "$APP"
+fi
+mkdir -p "$APP/data"
+
+# Refuse to deploy a copy that predates the punctuality fix. Without MINT_LEAD
+# the watcher mints its token *at* each burst and fires the T-20s and T-5s
+# passes ~35s AFTER the hammer, on lots whose price is already gone. It exits
+# 0 the whole time, so nothing downstream would ever reveal the loss.
+if ! grep -q 'MINT_LEAD' "$APP/alcopa_scrape.py"; then
+  echo "   FATAL: this checkout has no MINT_LEAD — it is the pre-fix code."
+  echo "   Push the current alcopa_scrape.py to $REPO first."
+  exit 1
+fi
 
 echo "== python deps + chromium"
 python3 -m venv "$APP/venv"
