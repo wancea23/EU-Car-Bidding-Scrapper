@@ -56,6 +56,23 @@ while :; do
         echo "!! no watch list after $TRIES attempts — nothing to watch today"
     fi
 
+    # Ship the day's capture OFF this box. Without this the container writes
+    # a perfect JSONL to a disk nobody else can read: the machine that owns
+    # vpauto.db is elsewhere, has no access here, and the whole point of the
+    # capture is to reach it. Push, so no inbound access or open port is
+    # needed. Skipped silently when the variables are unset.
+    if [ -n "$HF_TOKEN" ] && [ -n "$HF_DATASET" ] && [ -s "$DATA/prices-$DAY.jsonl" ]; then
+        python - "$DATA/prices-$DAY.jsonl" "$HF_DATASET" <<'PUSH' || echo "!! upload failed; the file is still in /data"
+import sys, os
+from huggingface_hub import HfApi
+path, repo = sys.argv[1], sys.argv[2]
+HfApi(token=os.environ["HF_TOKEN"]).upload_file(
+    path_or_fileobj=path, path_in_repo="prices/" + os.path.basename(path),
+    repo_id=repo, repo_type="dataset")
+print(f"uploaded {os.path.basename(path)} -> {repo}")
+PUSH
+    fi
+
     # Sleep to the next start. Computed in UTC on purpose: the scheduling
     # inside the watcher is epoch-based and timezone-independent, and this
     # keeps the daily boundary stable regardless of the container's TZ.

@@ -28,6 +28,10 @@ services:
       # Dumps the captcha page and the model's answer into /data when a mint
       # fails, which is the only way to tell a wrong answer from an IP ban.
       ALCOPA_DEBUG: "1"
+      # Where the day's capture is pushed when the run ends. Without this the
+      # container writes a perfect JSONL to a disk the machine that owns the
+      # database cannot reach. HF_TOKEN goes in .env alongside the Gemini key.
+      HF_DATASET: wancea/alcopa-prices
 
     # Headless Chromium dies on Docker's default 64MB /dev/shm in ways that
     # look random rather than like an OOM. The browser is also launched with
