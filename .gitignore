@@ -20,3 +20,7 @@ nul
 # run, so nothing here needs to travel to a deploy host.
 data/
 research/
+
+# never commit the API key the compose file loads
+.env
+deploy/.env

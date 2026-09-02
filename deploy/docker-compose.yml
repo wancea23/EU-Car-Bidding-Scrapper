@@ -1,0 +1,41 @@
+# Alcopa deadline watcher.
+#
+#   docker compose -f deploy/docker-compose.yml build
+#   docker compose -f deploy/docker-compose.yml up -d
+#
+# Put GEMINI_API_KEY in a .env file next to this one; it never enters the image.
+services:
+  alcopa-watcher:
+    build:
+      context: ..                 # repo root, so the Dockerfile can COPY the scrapers
+      dockerfile: deploy/Dockerfile
+    image: alcopa-watcher
+    restart: unless-stopped       # the container reschedules itself daily
+
+    env_file: .env                # GEMINI_API_KEY=...
+    environment:
+      # Only affects how log timestamps read. Scheduling is epoch-based
+      # (the site's own data-ts against time.time()), so this cannot move
+      # when a capture fires. Paris matches the auctions, so the log lines
+      # line up with the sale times on the site.
+      TZ: Europe/Paris
+      # RUN_AT_UTC: "04:30"       # daily rebuild+watch start, UTC
+
+    # Headless Chromium dies on Docker's default 64MB /dev/shm in ways that
+    # look random rather than like an OOM. The browser is also launched with
+    # --disable-dev-shm-usage, so this is belt and braces, not a requirement.
+    shm_size: 1gb
+
+    # No added capabilities, no privileged, no host packages. Chromium runs
+    # with --no-sandbox because its own sandbox needs user namespaces an
+    # unprivileged container will not have — the container is the boundary.
+    security_opt:
+      - no-new-privileges:true
+
+    volumes:
+      - ./data:/data              # watch list, captures, WAF token, debug dumps
+
+    # Outbound only; it listens on nothing and needs no ports published.
+    logging:
+      driver: json-file
+      options: {max-size: "10m", max-file: "5"}

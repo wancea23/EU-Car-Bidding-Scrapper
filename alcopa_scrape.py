@@ -26,6 +26,7 @@ source='alcopa', with Moldovan excise and landed cost from the shared helpers.
 from __future__ import annotations
 
 import argparse
+import glob
 import concurrent.futures as futures
 import html
 import json
@@ -44,7 +45,12 @@ from vpauto_scrape import (  # noqa: E402
 )
 
 HERE = Path(__file__).parent
-DATA = HERE / "data"
+# Everything this program writes lives under one directory so a container can
+# mount a single volume at it: the watch list, the captures, the WAF token and
+# any debug dumps. Without the override the token and captcha files landed in
+# /app/data while the captures went to /data — two places to mount, and one of
+# them silently ephemeral.
+DATA = Path(os.environ.get("ALCOPA_DATA") or (HERE / "data"))
 BASE = "https://www.alcopa-auction.fr"
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36")
@@ -157,7 +163,15 @@ def _mint_playwright() -> str | None:
     with sync_playwright() as pw:
         browser = pw.chromium.launch(
             headless=os.environ.get("ALCOPA_HEADFUL") != "1",
-            args=["--disable-blink-features=AutomationControlled"])
+            args=["--disable-blink-features=AutomationControlled",
+                  # Docker gives a container 64MB of /dev/shm and headless
+                  # Chromium falls over on that in ways that look random
+                  # rather than like an out-of-memory error.
+                  "--disable-dev-shm-usage",
+                  # Chromium's own sandbox needs user namespaces, which an
+                  # unprivileged container will not have. Without this it
+                  # simply refuses to start; the container is the sandbox.
+                  "--no-sandbox"])
         # Ask for English explicitly. The WAF localises its captcha to the
         # browser locale, and a French "Choisissez tous les ..." made the
         # instruction unreadable to the extractor below — the model then got
@@ -648,6 +662,33 @@ def parse_lot(page: str, url: str) -> dict:
 
     m = re.search(r"(?:Informations|Informa[țt]ii|Comentarii|Commentaires)\s*(.{0,400})", txt)
     rec["observations"] = m.group(1).strip() if m else None
+
+    # Documents. Both links sit on the lot page and neither was ever read, so
+    # ct_pdf and se_pdf were 100% NULL for Alcopa and the "has MOT/service
+    # docs" filter could never match an Alcopa lot. The CT is the French MOT
+    # and carries odometer readings — the main defence against a clocked car.
+    m = re.search(r'href="(/getDocument/ct/[^"]+)"', page)
+    rec["ct_pdf"] = BASE + m.group(1) if m else None
+    m = re.search(r'href="(https://api\.b2b\.autorigin\.com/[^"]+)"', page)
+    rec["se_pdf"] = html.unescape(m.group(1)) if m else None
+
+    # Two conditions that can make a lot worthless to him specifically, and
+    # neither was being detected. A trade-only sale cannot be bought by a
+    # private buyer at all, and a car banned from the road is not something to
+    # discover after paying for it and shipping it 2 500 km.
+    extra = []
+    if re.search(r"r[ée]serv[ée]e?s?\s+aux\s+professionnels", txt, re.I):
+        extra.append("PRO-ONLY")
+    if re.search(r"D[ée]faillance critique|non autoris[ée]\s+[àa] circuler", txt, re.I):
+        extra.append("ROAD-BAN")
+    if extra:
+        rec["red_flags"] = ",".join(
+            x for x in [rec.get("red_flags")] + extra if x)
+
+    m = re.search(r"Immatriculation[\s\S]{0,120}?>\s*([A-Z0-9-]{6,10})\s*<", page)
+    rec["plate"] = m.group(1) if m else None
+    m = re.search(r">\s*Lot\s+(\d{1,5})\s*<", page)
+    rec["lot_no"] = int(m.group(1)) if m else None
     return rec
 
 
@@ -674,7 +715,10 @@ def con_with_extras() -> sqlite3.Connection:
     con.executescript(EXTRA_SCHEMA)
     have = {r[1] for r in con.execute("PRAGMA table_info(lots)")}
     for col, decl in (("ends_ts", "INTEGER"), ("fees", "TEXT"), ("vin", "TEXT"),
-                      ("colour", "TEXT"), ("co2", "INTEGER")):
+                      ("colour", "TEXT"), ("co2", "INTEGER"),
+                      # the plate is what an Autorigin history is keyed on, and
+                      # the lot number is what you actually bid on in the room
+                      ("plate", "TEXT"), ("lot_no", "INTEGER")):
         if col not in have:
             con.execute(f"ALTER TABLE lots ADD COLUMN {col} {decl}")
     con.commit()
@@ -705,15 +749,23 @@ def save_lot(con: sqlite3.Connection, rec: dict, full: bool = True) -> str:
             "fuel=?, gearbox=?, location=?, tva_recup=?, observations=?, "
             "red_flags=?, photos=?, photo_count=?, excise_eur=?, landed_eur=?, "
             "card_year=?, card_km=?, scraped_at=?, ends_ts=?, fees=?, vin=?, "
-            "colour=?, co2=?, body=? WHERE lot_id=?",
+            "colour=?, co2=?, body=?, ct_pdf=?, se_pdf=?, plate=?, lot_no=? "
+            "WHERE lot_id=?",
             (rec.get("title"), first_reg, rec.get("km"), rec.get("cc"), fuel or None,
              rec.get("gearbox"), rec.get("location"), rec.get("tva_recup"),
-             rec.get("observations"), red_flags(rec.get("observations"), None),
+             rec.get("observations"),
+             # merge, do not recompute: parse_lot adds PRO-ONLY and ROAD-BAN,
+             # which the observations text alone does not reveal, and simply
+             # calling red_flags() again would throw both away.
+             ",".join(x for x in (red_flags(rec.get("observations"), None),
+                                  rec.get("red_flags")) if x) or None,
              "\n".join(rec.get("photos") or []), len(rec.get("photos") or []),
              exc, land, rec.get("year"), rec.get("km"), ts,
              rec.get("ends_ts"), rec.get("fees"), rec.get("vin"),
              rec.get("colour"), rec.get("co2"),
-             rec.get("specs", {}).get("body"), lot_id))
+             rec.get("specs", {}).get("body"),
+             rec.get("ct_pdf"), rec.get("se_pdf"),
+             rec.get("plate"), rec.get("lot_no"), lot_id))
         for d in rec.get("damage") or []:
             con.execute("INSERT OR IGNORE INTO damage VALUES (?,?,?,?,?,?)",
                         (lot_id, d["zone"], d["zone_label"], d["type"],
@@ -867,6 +919,7 @@ def cmd_watch(args) -> None:
     schedule = sorted((end + off, end, off)
                       for end in groups for off in offsets)
     now = time.time()
+    refreshed: set[int] = set()           # sales already given their closing token
     for at, end, off in schedule:
         if at < now - 30 and off < -20:
             continue                      # that moment is already gone
@@ -880,8 +933,32 @@ def cmd_watch(args) -> None:
             print(f"  sleeping {lead:.0f}s -> "
                   f"{time.strftime('%H:%M:%S', time.localtime(end))} T{off:+d}s")
             time.sleep(lead)
-        # must outlive the lead-in plus the burst itself
-        waf_token(min_remaining=MINT_LEAD + 70)
+        # Minting early is not enough on its own. With a plain age threshold
+        # the token happens to expire during the final approach, so the T-20s
+        # and T-5s passes — the only ones that still see a price — stall behind
+        # a ~55s captcha and land after the hammer anyway. Instead: one FORCED
+        # mint as each sale enters its closing window (the T-120s pass, whose
+        # lead-in puts the solve at ~T-210s), which is then good for the whole
+        # run down to +90s. Every later pass reuses it and none of them stalls.
+        # A failed mint must cost ONE PASS, never the day. On 2026-09-02 a
+        # forced mint failed four times at 19:00, waf_token raised, and the
+        # exception unwound the whole loop — killing the process and with it
+        # the rest of 19:00 plus the entire 20:00 and 21:00 sales, about 600
+        # lots whose prices no longer exist anywhere. The captcha is a remote
+        # dependency that will sometimes fail; the schedule has to outlive it.
+        try:
+            if off <= -300:
+                waf_token(min_remaining=MINT_LEAD + 70)
+            elif end not in refreshed:
+                waf_token(force=True)
+                refreshed.add(end)
+            else:
+                waf_token()
+        except Exception as e:                              # noqa: BLE001
+            print(f"  !! no token for {time.strftime('%H:%M', time.localtime(end))} "
+                  f"T{off:+d}s ({str(e)[:60]}) — skipping this pass, "
+                  f"continuing the day")
+            continue
         wait = at - time.time()
         if wait > 0:
             time.sleep(wait)
@@ -905,8 +982,18 @@ def cmd_watch(args) -> None:
                         "state": rec.get("sale_state"),
                         "fees": rec.get("fees"),
                     }, ensure_ascii=False) + "\n")
+        # Count PRICES, not fetches. A whole sale that had already closed
+        # before we started watching still reports "46/46 lots in 1.3s" — a
+        # perfect-looking capture of nothing, because every page fetched fine
+        # and every price was already stripped. That is the only number worth
+        # reading in this log, so make the miss impossible to overlook.
+        priced = sum(1 for rec in recs if rec and rec.get("current_price") is not None)
+        alarm = ""
+        if off <= 0 and got and not priced:
+            alarm = "   <-- NO PRICES: this sale closed before we got here"
         print(f"  {time.strftime('%H:%M:%S', time.localtime(end))} T{off:+d}s  "
-              f"{got}/{len(urls)} lots in {time.time() - t0:.1f}s")
+              f"{got}/{len(urls)} lots, {priced} priced, in "
+              f"{time.time() - t0:.1f}s{alarm}")
     if con is not None:
         con.close()
 
@@ -1000,9 +1087,18 @@ def cmd_sales(args) -> None:
                 if not m:
                     continue
                 lid = f"alcopa:{m.group(1)}"
-                if lid not in out:
+                # A lot can appear on more than one sale page, and sales are
+                # walked in ALPHABETICAL url order, not chronological. Taking
+                # the first one seen therefore stamped lots with whichever
+                # sale happened to sort first — 46 lots were given a 16:20
+                # clock while they actually closed hours earlier, so the
+                # watcher turned up to a sale that was already over and logged
+                # a flawless "46/46 lots" having captured nothing.
+                # The earliest clock is the one that fires first, so it wins.
+                cur = out.get(lid)
+                if cur is None or end < cur["ends_ts"]:
                     out[lid] = {"lot_id": lid, "url": BASE + href, "ends_ts": end}
-                    fresh += 1
+                    fresh += 1 if cur is None else 0
             added += fresh
             if len(set(links)) < 20:        # short page = last page
                 break
@@ -1014,11 +1110,114 @@ def cmd_sales(args) -> None:
     dest.parent.mkdir(parents=True, exist_ok=True)
     dest.write_text(json.dumps(sorted(out.values(), key=lambda r: r["ends_ts"]),
                                ensure_ascii=False, indent=1), encoding="utf-8")
+
+    # Persist the deadlines, don't just hand them to the watcher. This is the
+    # ONLY place a room lot's closing time is ever known: its own page carries
+    # no clock, so a lot harvested from the lot page keeps ends_ts NULL for
+    # ever. Writing only the JSON left 3 242 Alcopa lots showing "no closing
+    # time" on the site while the sale page plainly displayed a countdown.
+    # Skipped silently where there is no database, because this command is
+    # also what runs on a server that has only the JSON.
+    if (DATA / "vpauto.db").exists():
+        con = con_with_extras()
+        n = 0
+        for r in out.values():
+            n += con.execute(
+                "UPDATE lots SET ends_ts=? WHERE lot_id=? "
+                "AND (ends_ts IS NULL OR ends_ts != ?)",
+                (r["ends_ts"], r["lot_id"], r["ends_ts"])).rowcount
+        con.commit()
+        con.close()
+        print(f"{n} lots given a closing time in the database")
     groups = sorted({r["ends_ts"] for r in out.values()})
     print(f"\n{len(out)} lots across {len(groups)} closing times -> {dest}")
     for g in groups[:14]:
         n = sum(1 for r in out.values() if r["ends_ts"] == g)
         print(f"   {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(g))}  {n:>5} lots")
+
+
+def cmd_merge(args) -> None:
+    """Fold captured JSONL observations back into the database.
+
+    `watch --lots` runs without a database on purpose, so it can work on a
+    server that has none. The consequence was that nothing ever read those
+    files back: every hammer price the watcher captured lived only in a JSONL
+    and never reached the site. This is the missing half of that design.
+
+    Idempotent: `price_log`'s key is (lot_id, ts) and ts is derived from the
+    observation's own timestamp, never from the clock at merge time, so
+    re-merging the same file — or two files that overlap across midnight —
+    converges instead of duplicating.
+    """
+    files = [Path(p) for pat in args.files for p in glob.glob(pat)]
+    if not files:
+        sys.exit("no JSONL files matched")
+    con = con_with_extras()
+
+    per_lot: dict[str, dict] = {}
+    logged = 0
+    for fp in files:
+        for line in fp.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            try:
+                r = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            lid = r["lot_id"]
+            d = per_lot.setdefault(lid, {"obs": [], "fees": None, "ends": None})
+            d["obs"].append(r)
+            d["fees"] = d["fees"] or r.get("fees")
+            d["ends"] = d["ends"] or r.get("ends_ts")
+            if r.get("price") is not None:
+                ts = time.strftime("%Y-%m-%d %H:%M:%S",
+                                   time.localtime(r["observed_at"]))
+                logged += con.execute(
+                    "INSERT OR IGNORE INTO price_log (lot_id, ts, state, price) "
+                    "VALUES (?,?,?,?)",
+                    (lid, ts, r.get("state"), r["price"])).rowcount
+
+    closed = priced = 0
+    for lid, d in per_lot.items():
+        obs = d["obs"]
+        # A lot is finished once we have a pass from after its deadline. That
+        # is decided by the clock we scheduled against, not by a badge on the
+        # page: across 780 observations Alcopa never once rendered "adjuge"
+        # within 90s of the close, so waiting for that text records nothing.
+        is_closed = any(o["offset"] >= 90 for o in obs)
+        # The last price seen before the hammer. Nearest to the close wins,
+        # because that is the number the lot actually made; anything earlier
+        # is a bid that was later beaten.
+        pre = [o for o in obs if o["offset"] <= 0 and o.get("price") is not None]
+        final = max(pre, key=lambda o: o["offset"])["price"] if pre else None
+
+        if is_closed:
+            closed += 1
+            if final is not None:
+                priced += 1
+                # COALESCE so a re-merge can never overwrite a good figure
+                # with a worse one, and 'termine' rather than 'adjuge': we
+                # know the sale ENDED, not that it found a buyer.
+                con.execute(
+                    "UPDATE lots SET sale_price=COALESCE(sale_price,?), "
+                    "sale_state='termine', current_bid=NULL WHERE lot_id=?",
+                    (final, lid))
+        elif final is not None:
+            con.execute("UPDATE lots SET current_bid=? WHERE lot_id=?",
+                        (final, lid))
+        # fees is dropped by save_lot(full=False), so the watch path never
+        # stored it even with a database attached — 14.40% + 141.67 EUR of
+        # difference riding on one word.
+        if d["fees"]:
+            con.execute("UPDATE lots SET fees=COALESCE(fees,?) WHERE lot_id=?",
+                        (d["fees"], lid))
+        if d["ends"]:
+            con.execute("UPDATE lots SET ends_ts=COALESCE(ends_ts,?) "
+                        "WHERE lot_id=?", (d["ends"], lid))
+    con.commit()
+    con.close()
+    print(f"{len(files)} file(s), {len(per_lot)} lots, {logged} new price_log rows")
+    print(f"{closed} lots closed, {priced} given a final price")
 
 
 def cmd_exportlots(args) -> None:
@@ -1088,13 +1287,16 @@ def main() -> None:
                     help="only sales closing within this many seconds")
     sa.add_argument("--max-pages", type=int, default=90)
     sa.add_argument("--out")
+    mg = sub.add_parser("merge")
+    mg.add_argument("files", nargs="+", metavar="JSONL",
+                    help="watch output to fold back into the database")
     el = sub.add_parser("exportlots")
     el.add_argument("--horizon", type=int, default=86400)
     el.add_argument("--out")
     sub.add_parser("report")
     args = ap.parse_args()
     {"discover": cmd_discover, "harvest": cmd_harvest, "refresh": cmd_refresh,
-     "watch": cmd_watch, "report": cmd_report,
+     "watch": cmd_watch, "report": cmd_report, "merge": cmd_merge,
      "exportlots": cmd_exportlots, "sales": cmd_sales}[args.cmd](args)
 
 

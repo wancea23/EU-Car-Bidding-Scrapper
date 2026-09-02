@@ -1,25 +1,48 @@
 #!/bin/sh
-# One auction day, start to finish. Runs once a day from cron; the watch
-# command itself sleeps between sales, so a single process covers all of them.
+# One auction day, then sleep to the next. Runs as the container's only
+# process, so `restart: unless-stopped` is the whole scheduler — no cron
+# inside the image, nothing to install on the host.
 #
-# Alcopa strips a lot's price the second it sells, so the whole point of this
-# container is to be awake at each closing second without anyone's desktop
-# being involved.
+# Alcopa strips a lot's price the second it sells, so the point of this
+# container is to be awake at each closing second on a machine that is
+# already on.
+#
+# Everything is written under $ALCOPA_DATA (set to /data in the image), so a
+# single volume mount captures the watch list, the captures, the WAF token
+# and any debug dumps.
 set -e
 cd /app
-mkdir -p /app/data /data
+DATA="${ALCOPA_DATA:-/data}"
+START_HOUR="${RUN_AT_UTC:-04:30}"
+mkdir -p "$DATA"
 
-# 1. Rebuild the watch list FIRST, every day, from the sale pages.
-#    Baking it into the image was the old bug: the file went stale after a
-#    day and every later run reported "nothing closing inside the horizon"
-#    and exited 0 — a silent no-op that looks exactly like a healthy run.
-#    Sale pages are also the only place a room lot's clock exists at all.
-python alcopa_scrape.py sales --horizon 1209600 --out /data/watchlist.json
+while :; do
+    DAY=$(date -u +%Y-%m-%d)
+    echo "=== $(date -u +%H:%M:%SZ) starting $DAY"
 
-# 2. Sit on every sale closing in the next 24h. One process, not one per
-#    sale: groups minutes apart must share a timeline or the second sale's
-#    pre-close burst is slept through while the first one's finishes.
-exec python alcopa_scrape.py watch \
-     --lots /data/watchlist.json \
-     --out "/data/prices-$(date -u +%Y-%m-%d).jsonl" \
-     --horizon 86400 --workers 24
+    # Rebuild the watch list FIRST, every day, from the sale pages. Carrying
+    # yesterday's over makes the watcher print "nothing closing inside the
+    # horizon" and exit 0 — a silent no-op that reads as a healthy run. Sale
+    # pages are also the only place a room lot's clock exists at all.
+    python -u alcopa_scrape.py sales --horizon 1209600 \
+           --out "$DATA/watchlist.json" || echo "!! sales failed, skipping the day"
+
+    if [ -s "$DATA/watchlist.json" ]; then
+        # One process for the whole day: sales minutes apart must share a
+        # timeline, or the second sale's pre-close burst is slept through
+        # while the first one's is still finishing.
+        python -u alcopa_scrape.py watch \
+               --lots "$DATA/watchlist.json" \
+               --out "$DATA/prices-$DAY.jsonl" \
+               --horizon 86400 --workers 24 || echo "!! watch exited non-zero"
+    fi
+
+    # Sleep to the next start. Computed in UTC on purpose: the scheduling
+    # inside the watcher is epoch-based and timezone-independent, and this
+    # keeps the daily boundary stable regardless of the container's TZ.
+    NOW=$(date -u +%s)
+    NEXT=$(date -u -d "today $START_HOUR" +%s 2>/dev/null || echo 0)
+    [ "$NEXT" -le "$NOW" ] && NEXT=$(date -u -d "tomorrow $START_HOUR" +%s)
+    echo "=== sleeping until $(date -u -d "@$NEXT" +'%Y-%m-%d %H:%M:%SZ')"
+    sleep $((NEXT - NOW))
+done

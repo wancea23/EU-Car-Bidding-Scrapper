@@ -23,6 +23,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import datetime as dt
 import json
 import os
 import random
@@ -75,7 +76,13 @@ def _age_col(age_years: int) -> int:
 
 
 def _band(cc: int, fuel: str) -> str:
-    diesel = fuel.lower().startswith("diesel")
+    # Diesel must be detected anywhere in the label, not just at the start:
+    # VPauto writes "Gazole", "Electricite / Gazole", "GAS + ELEK HR", and
+    # Alcopa's raw codes were the same class of bug (GO/ES/EL vs startswith).
+    # Getting this wrong moves a car across the 1500cc cliff, which is worth
+    # thousands.
+    low = fuel.lower()
+    diesel = low.startswith("diesel") or "gazole" in low or "diesel" in low
     if diesel:
         return "p1500" if cc <= 1500 else ("p3000" if cc <= 2500 else "pbig")
     if cc <= 1000:
@@ -94,14 +101,33 @@ def excise_eur(cc: int, fuel: str, first_reg: str | None) -> float | None:
     if not fuel or not first_reg:
         return None
     f = fuel.lower()
-    if "lectri" in f:            # Electrique -> exempt, and cc is 0 on those lots
-        return 0.0
+    # Only a pure EV is exempt. VPauto writes combined labels like
+    # "Electricite / Gazole" (a diesel plug-in hybrid) and "ESS + ELEK HR",
+    # and testing for "lectri" first exempted a real diesel engine from excise
+    # altogether — a Mercedes GLC 300 de came out at 0 EUR instead of several
+    # thousand. If another fuel is named too, it is a hybrid, not an EV.
+    combustion = ("gazole", "diesel", "essence", "ess ", "ess+", "gpl",
+                  "gaz", "eth", "hybride")
+    if "lectri" in f or "elek" in f:
+        if not any(k in f for k in combustion):
+            return 0.0          # genuinely electric only; cc is 0 on those lots
+        if not cc:
+            return None
+        # combined label = a hybrid; fall through so the multiplier applies
     if not cc:
         return None
     mult = 1.0
-    if "hybride rechargeable" in f or "plug" in f:
+    # VPauto abbreviates on some lots: "HR" = hybride rechargeable (plug-in),
+    # "HNR" = hybride non rechargeable. Those were matching none of the long
+    # spellings, so 40 rows silently paid full excise.
+    if "hybride rechargeable" in f or "plug" in f or " hr" in f or f.endswith("hr"):
         mult = 0.5
-    elif "hybride" in f and "micro" not in f and "mild" not in f:
+    elif ("hybride" in f or "hnr" in f
+          or ("lectri" in f or "elek" in f))             and "micro" not in f and "mild" not in f:
+        # A combined electric+combustion label with no explicit "rechargeable"
+        # marker is treated as an ordinary hybrid: that understates the
+        # discount rather than overstating it, which is the safe direction for
+        # a cost estimate.
         mult = 0.75
     try:
         d, m, y = (int(x) for x in first_reg.split("/"))
@@ -263,11 +289,66 @@ def parse_lot(html: str, url: str) -> dict:
     title = re.search(r"<title>\s*(.*?)\s*(?:\||</title>)", h, re.S)
     lot_id = url.split("/")[2] if url.startswith("/vehicule/") else url
 
-    sold = None
+    # Order matters: the negative must be tested first, because "n'a pas été
+    # adjugé" contains "adjugé".
+    sold, hammer = None, None
     if re.search(r"n(?:&#039;|')a pas .t. adjug", h):
         sold = "non_adjuge"
-    elif re.search(r"a .t. adjug", h):
+    elif re.search(r"a .t. adjug|V.hicule adjug", h):
+        # A sold lot says "Véhicule adjugé", NOT "a été adjugé" — matching only
+        # the latter left every sold VPauto lot reading as still open, showing
+        # its opening price as if bidding had not happened.
         sold = "adjuge"
+        hammer = _euro(h, r'V.hicule adjug.[\s\S]{0,120}?'
+                          r'class="amount"[^>]*>\s*([0-9 .,]+)\s*&euro;')
+
+    # VPauto lots DO have a closing time — we were simply never reading it, so
+    # every VPauto card said "no closing time" while the site showed a live
+    # countdown. It is on the .countdown element as data-end-date, in Paris
+    # local time. A page carries two: the live opening (09:00) and the lot's
+    # own sale start (10:00); the later one is the lot's, so take the max.
+    # Pick the countdown by its LABEL, never by max(). A page carries several
+    # data-end-date stamps and the latest one is usually the wrong one:
+    #   * on an unsold lot the widget counts down to "Fin de l'apres vente",
+    #     a post-sale offer window up to a day after bidding actually ended —
+    #     max() chose it for all 201 unsold lots, so their clock said the
+    #     auction was still open when it was over and lost;
+    #   * on a sold lot the latest stamp is the "Exposition" viewing banner.
+    # The sale's own clock sits under "Ouverture de la vente".
+    ends_ts = apres_vente = None
+    try:
+        from zoneinfo import ZoneInfo
+        paris = ZoneInfo("Europe/Paris")
+
+        def _epoch(s: str) -> int | None:
+            m = re.match(r"(\d{4})/(\d{2})/(\d{2}) (\d{2}):(\d{2}):(\d{2})$", s)
+            if not m:
+                return None
+            return int(dt.datetime(*(int(x) for x in m.groups()),
+                                   tzinfo=paris).timestamp())
+
+        # each stamp with the ~400 chars of markup before it, so the nearest
+        # preceding label can be read
+        for m in re.finditer(r'data-end-date="([^"]+)"', h):
+            before = h[max(0, m.start() - 400):m.start()]
+            ts = _epoch(m.group(1))
+            if ts is None:
+                continue
+            if re.search(r"apr[eè]s[\s-]*vente", before, re.I):
+                apres_vente = apres_vente or ts
+            elif re.search(r"Ouverture de la vente|id=\"countdown\"", before, re.I):
+                ends_ts = ends_ts or ts
+        # Fall back to the EARLIEST stamp rather than the latest: the sale
+        # close precedes both the after-sale deadline and the viewing banner.
+        if ends_ts is None:
+            all_ts = [t for t in (_epoch(x) for x in
+                                  re.findall(r'data-end-date="([^"]+)"', h)) if t]
+            ends_ts = min(all_ts) if all_ts else None
+    except Exception as exc:                                # noqa: BLE001
+        # Narrow enough to notice: a missing tz database would otherwise null
+        # every VPauto closing time silently.
+        print(f"  ! ends_ts parse failed: {str(exc)[:80]}")
+        ends_ts = None
 
     photos = sorted({u for u in re.findall(r"https?://cdn\.vpauto\.fr/[^\"')\s]+\.jpe?g", h)
                      if u.endswith("-1200.jpg")})
@@ -301,6 +382,9 @@ def parse_lot(html: str, url: str) -> dict:
         "prix_neuf": _euro(h, r"<span>Prix neuf</span>[\s\S]{0,80}?<span[^>]*>\s*([0-9 .,]+)\s*&euro;"),
         "tva_recup": 1 if re.search(r"TVA\s*:\s*oui", h, re.I) else 0,
         "sold_status": sold,
+        "ends_ts": ends_ts,
+        # the hammer price, which only a sold lot has
+        "sale_price": hammer,
         "observations": obs_txt,
         "photo_count": len(photos),
         "photos": "\n".join(photos),
@@ -362,7 +446,10 @@ def db() -> sqlite3.Connection:
     for col, decl in (("red_flags", "TEXT"), ("mise_a_prix_ht", "REAL"),
                       ("sale_state", "TEXT"), ("sale_price", "REAL"),
                       ("current_bid", "REAL"), ("card_year", "INTEGER"),
-                      ("card_km", "INTEGER"), ("last_seen", "TEXT"), ("source", "TEXT")):
+                      ("card_km", "INTEGER"), ("last_seen", "TEXT"), ("source", "TEXT"),
+                      # VPauto lots have a closing time too — it was simply
+                      # never read, so every VPauto card said "no closing time"
+                      ("ends_ts", "INTEGER"), ("sold_status", "TEXT")):
         if col not in have:
             con.execute(f"ALTER TABLE lots ADD COLUMN {col} {decl}")
     # backfill flags for rows stored before the column existed
@@ -508,7 +595,11 @@ def cmd_refresh(limit: int) -> None:
     rows = con.execute(
         "SELECT lot_id, url FROM lots "
         "WHERE COALESCE(source,'vpauto')='vpauto' "
-        "  AND (COALESCE(photo_count,0)=0 OR cc IS NULL) "
+        # ends_ts and sold_status were added later, so a lot whose detail page
+        # was fetched before then looks complete while carrying no clock and no
+        # sale outcome — which is what made every VPauto card read "no closing
+        # time" and show a sold lot's opening price as if it were still open.
+        "  AND (COALESCE(photo_count,0)=0 OR cc IS NULL OR ends_ts IS NULL) "
         "ORDER BY COALESCE(sale_price, current_bid, mise_a_prix) DESC"
     ).fetchall()
     if limit:

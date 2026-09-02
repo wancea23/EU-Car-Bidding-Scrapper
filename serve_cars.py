@@ -18,6 +18,8 @@ import importlib.util
 import json
 import re
 import sqlite3
+import threading
+import time
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -93,8 +95,20 @@ def slug_parts(url: str) -> tuple[str, str]:
     u = url or ""
     m = re.search(r"/vehicule/[0-9a-f]+/([^/?#]+)", u)
     if m:
-        head, _, rest = m.group(1).partition("-")
-        return head, rest
+        slug = m.group(1)
+        # Split on the FIRST hyphen only and a two-word marque loses its second
+        # half: "alfa-romeo-junior..." became make "Alfa" while the same brand
+        # from Alcopa (which has its own path segment) came through as
+        # "Alfa-Romeo". The dropdown then listed both, each holding half the
+        # cars, with nothing to say they were the same marque.
+        for two in ("alfa-romeo", "land-rover", "mercedes-benz", "aston-martin",
+                    "rolls-royce", "great-wall", "ssang-yong", "dr-automobiles"):
+            if slug.startswith(two + "-"):
+                return two, slug[len(two) + 1:]
+        head, _, rest = slug.partition("-")
+        # VPauto writes "mercedes-classe-a" where Alcopa writes "mercedes-benz",
+        # so the same marque still arrived under two dropdown entries.
+        return {"mercedes": "mercedes-benz", "vw": "volkswagen"}.get(head, head), rest
     m = re.search(r"/(?:[a-z]{2}/)?(?:voiture|utilitaire|vehicule)[a-z-]*/"
                   r"([^/?#]+)/([^/?#]+)", u)
     if m:
@@ -149,11 +163,69 @@ def md_match(url: str, year: int | None, cc: int | None, fuel: str | None) -> di
 
 
 # ------------------------------------------------------------------ loading
+def fmt_left(secs: float) -> str:
+    """A closing clock people can read at a glance, not a duration dump.
+
+    Precision follows urgency: days out, nobody cares about seconds; inside the
+    last minute, seconds are the only thing that matters.
+    """
+    secs = int(abs(secs))
+    d, rem = divmod(secs, 86400)
+    h, rem = divmod(rem, 3600)
+    m, s = divmod(rem, 60)
+    if d:
+        return f"{d}d {h:02d}h"
+    if h:
+        return f"{h}h {m:02d}m"
+    if m:
+        return f"{m}m {s:02d}s"
+    return f"{s}s"
+
+
+# ------------------------------------------------------------------- saved
+# A shortlist kept in a plain JSON file rather than in the lots database. The
+# scrapers hold that database open and write to it while the site is being
+# browsed, and a saved lot is his own note — it should not be at risk from a
+# re-harvest, nor should a click here ever contend for a write lock with a
+# scrape that is capturing a closing price.
+SAVED_PATH = Path(__file__).parent / "data" / "saved.json"
+_saved_lock = threading.Lock()
+
+
+def saved_ids() -> set[str]:
+    try:
+        return set(json.loads(SAVED_PATH.read_text(encoding="utf-8")))
+    except Exception:                                   # noqa: BLE001
+        return set()
+
+
+def saved_toggle(lot_id: str) -> bool:
+    with _saved_lock:
+        ids = saved_ids()
+        on = lot_id not in ids
+        ids.add(lot_id) if on else ids.discard(lot_id)
+        SAVED_PATH.parent.mkdir(parents=True, exist_ok=True)
+        SAVED_PATH.write_text(json.dumps(sorted(ids)), encoding="utf-8")
+        return on
+
+
 def price_of(r: dict) -> tuple[float | None, str]:
     """The most meaningful money on the row, and what it means."""
+    # A VPauto detail page states the outcome outright ("Véhicule adjugé", or
+    # "n'a pas été adjugé"). That beats the listing card, which keeps showing
+    # the opening price long after the sale has run — which is how a lot that
+    # made 5 400 was still being displayed as "OPENING 5 400".
+    if r.get("sold_status") == "adjuge" and r.get("sale_price"):
+        return r["sale_price"], "hammer"
     if r.get("sale_price"):
         return r["sale_price"], "hammer"
     if r.get("current_bid"):
+        # Alcopa's data-current-price carries the OPENING price until somebody
+        # actually bids — the page labels that very number "Mise a prix".
+        # Treating it as a live bid put "LIVE / live bid" on ~2 030 lots that
+        # had never received one. Equal to the opening price means no bid yet.
+        if r.get("mise_a_prix") and r["current_bid"] == r["mise_a_prix"]:
+            return r["current_bid"], "opening"
         return r["current_bid"], "live bid"
     if r.get("mise_a_prix"):
         return r["mise_a_prix"], "opening"
@@ -188,7 +260,7 @@ def build_rows() -> list[dict]:
 
         cell = md_match(r.get("url", ""), year, cc, fuel)
         md_price = cell["price_median"] if cell else None
-        margin = round(md_price - landed) if (md_price and landed) else None
+        margin = None          # recomputed below, once landed is source-aware
 
         photos = [p for p in (r.get("photos") or "").split("\n") if p.strip()]
         title = r.get("title") or (make + " " + rest.replace("-", " ")).strip().title()
@@ -205,13 +277,19 @@ def build_rows() -> list[dict]:
         except Exception:
             equipment = []
 
-        out.append({
+        row = {
             "id": r["lot_id"], "url": r.get("url"), "title": title,
             "make": make.title(), "year": year, "km": km, "cc": cc, "fuel": fuel,
             "gearbox": r.get("gearbox"), "power": r.get("power_hp"),
             "euro": r.get("euro_norm"), "book": r.get("service_book"),
             "location": r.get("location"), "first_reg": r.get("first_reg"),
-            "state": r.get("sale_state"), "price": price, "price_kind": kind,
+            # The detail page's verdict wins over the listing card's state:
+            # the card goes stale and keeps a sold lot looking open.
+            "state": ("adjuge" if r.get("sold_status") == "adjuge"
+                      else "non_adjuge" if r.get("sold_status") == "non_adjuge"
+                      else r.get("sale_state")),
+            "sold_status": r.get("sold_status"),
+            "price": price, "price_kind": kind,
             "cote": cote, "prix_neuf": r.get("prix_neuf"), "discount": discount,
             "excise": round(excise) if excise else None,
             "landed": round(landed) if landed else None,
@@ -240,7 +318,22 @@ def build_rows() -> list[dict]:
             "vin": r.get("vin"), "colour": r.get("colour"),
             "co2": r.get("co2"), "body": r.get("body"),
             "ends_ts": r.get("ends_ts"),
-        })
+        }
+        # Landed cost comes from the SAME stack the detail page prints, not
+        # from vp.landed_eur(). That helper charges VPauto's 200 EUR dossier
+        # fee to every row and knows nothing of Alcopa's 14.40% buyer's
+        # premium, so the grid understated an Alcopa en_sus lot by ~1 100 EUR
+        # while the detail page had it right — and "MD margin" is the column
+        # the whole grid is ranked by. One source of truth now.
+        try:
+            _, row["landed"] = cost_lines(row)
+        except Exception:                                   # noqa: BLE001
+            pass
+        if row["landed"]:
+            row["landed"] = round(row["landed"])
+        row["margin"] = (round(md_price - row["landed"])
+                         if (md_price and row["landed"]) else None)
+        out.append(row)
     con.close()
     return out
 
@@ -257,9 +350,17 @@ def refresh_if_stale(min_gap: float = 20.0) -> None:
     if now - _STATE["checked"] < min_gap:
         return
     _STATE["checked"] = now
+    # The database runs in WAL mode, so a scrape's writes land in vpauto.db-wal
+    # and the main file's mtime does not move until a checkpoint. Watching only
+    # the main file therefore made the site serve stale rows for as long as a
+    # backfill ran — measured at 26 minutes behind while two were writing, and
+    # exactly the "prices don't update" symptom. Take the newest of the set.
     try:
-        mtime = DB.stat().st_mtime
-    except OSError:
+        mtime = max(p.stat().st_mtime
+                    for p in (DB, DB.with_name(DB.name + "-wal"),
+                              DB.with_name(DB.name + "-shm"))
+                    if p.exists())
+    except (OSError, ValueError):
         return
     if mtime == _STATE["mtime"]:
         return
@@ -329,20 +430,56 @@ def apply_filters(rows: list[dict], q: dict) -> list[dict]:
         rows = [r for r in rows if r["ct_pdf"] or r["se_pdf"]]
     if g("md") == "1":
         rows = [r for r in rows if r["md_price"]]
-    for key, field in (("minpx", "price"), ("mindisc", "discount"), ("minmargin", "margin")):
-        v = g(key)
-        if v:
-            try:
-                fv = float(v)
-                rows = [r for r in rows if r[field] is not None and r[field] >= fv]
-            except ValueError:
-                pass
-    v = g("maxpx")
-    if v:
+    # Closed vs still open, straight off the clock rather than off sale_state —
+    # a lot can sit at "en_cours" long after its sale has actually run.
+    if g("closed") == "1":
+        rows = [r for r in rows if r.get("ends_ts") and r["ends_ts"] <= time.time()]
+    if g("opennow") == "1":
+        rows = [r for r in rows if r.get("ends_ts") and r["ends_ts"] > time.time()]
+    if g("saved") == "1":
+        keep = saved_ids()
+        rows = [r for r in rows if str(r["id"]) in keep]
+
+    # Min/max on every numeric field, the 999 scrapper's <field>_min /
+    # <field>_max scheme. What was here before was an ad-hoc minpx / maxpx /
+    # mindisc / minmargin quartet: three fields, with an upper bound on only
+    # one of them. You could not ask for "2018 to 2021" or "under 150 000 km",
+    # which is how anyone actually shops for a car to import. All four old
+    # names still work, folded into the same machinery, so saved URLs and the
+    # JSON links keep behaving exactly as before.
+    RANGES = {"price": "price", "landed": "landed", "year": "year", "km": "km",
+              "cc": "cc", "power": "power", "margin": "margin",
+              "discount": "discount", "mdprice": "md_price"}
+
+    def num(v):
+        """Tolerate what people actually type: '150 000', '12,5', ''."""
         try:
-            rows = [r for r in rows if r["price"] is not None and r["price"] <= float(v)]
-        except ValueError:
-            pass
+            return float(str(v).replace(" ", "").replace(" ", "").replace(",", "."))
+        except (TypeError, ValueError):
+            return None
+
+    bounds: dict[str, list] = {}
+    for base, field in RANGES.items():
+        lo, hi = num(g(f"{base}_min")), num(g(f"{base}_max"))
+        if lo is not None or hi is not None:
+            bounds[field] = [lo, hi]
+    for old, field, side in (("minpx", "price", 0), ("maxpx", "price", 1),
+                             ("mindisc", "discount", 0), ("minmargin", "margin", 0)):
+        v = num(g(old))
+        if v is not None:
+            bounds.setdefault(field, [None, None])[side] = v
+
+    for field, (lo, hi) in bounds.items():
+        kept = []
+        for r in rows:
+            v = num(r.get(field))
+            # A lot carrying no value for the field cannot satisfy a bound, so
+            # it drops out — the same as the code this replaces. Worth knowing
+            # for cc and margin, which plenty of lots simply do not have.
+            if v is None or (lo is not None and v < lo) or (hi is not None and v > hi):
+                continue
+            kept.append(r)
+        rows = kept
 
     sort = g("sort", "discount")
     rev = g("dir", "desc") != "asc"
@@ -445,7 +582,7 @@ button.ghost{background:var(--surf2);color:var(--ink2);border:1px solid var(--ru
 .pager{grid-column:1/-1;display:flex;flex-wrap:wrap;gap:6px;align-items:center;
   justify-content:center;padding:22px 0 6px}
 .pager a{padding:6px 12px;border:1px solid var(--rule);border-radius:6px;font-size:13px;
-  color:var(--dim);text-decoration:none;background:var(--surf2)}
+  color:var(--mut);text-decoration:none;background:var(--surf2)}
 .pager a:hover{border-color:var(--acc);color:var(--acc)}
 .pager a.on{background:var(--acc);color:#06201E;border-color:var(--acc);font-weight:600}
 .pager .gap{color:var(--mut);padding:0 2px}
@@ -473,7 +610,12 @@ button.ghost{background:var(--surf2);color:var(--ink2);border:1px solid var(--ru
   font-size:9px;font-style:italic;font-weight:700;cursor:help;vertical-align:middle;
   position:relative;font-family:Georgia,serif}
 .ci:hover,.ci:focus{border-color:var(--acc);color:var(--acc);outline:none}
-.ci::after{content:attr(data-info);position:absolute;bottom:150%;left:50%;
+/* the "=" twin of "i": what arithmetic produced this number */
+.ci.eq{font-family:"IBM Plex Mono",monospace;font-style:normal;font-size:10px;
+  margin-left:3px;border-color:#3f5a54;color:var(--acc)}
+.ci.eq::after{white-space:pre-line;font-family:"IBM Plex Mono",monospace;
+  font-size:11px;width:320px}
+.ci::after{content:attr(data-info);white-space:pre-line;position:absolute;bottom:150%;left:50%;
   transform:translateX(-50%);width:290px;background:#0d1117;color:#c9d1d9;
   border:1px solid var(--rule);border-radius:7px;padding:9px 11px;font-size:11.5px;
   font-style:normal;font-weight:400;line-height:1.5;text-align:left;
@@ -488,15 +630,28 @@ button.ghost{background:var(--surf2);color:var(--ink2);border:1px solid var(--ru
 .dz-key{display:inline-flex;align-items:center;gap:5px;font-size:11px;
   background:var(--surf2);border:1px solid var(--rule);border-radius:5px;padding:3px 7px}
 .dz-key i{width:9px;height:9px;border-radius:2px;display:inline-block}
-#dzmodal{position:fixed;inset:0;background:#000000c4;display:none;z-index:50;
-  align-items:center;justify-content:center;padding:20px}
-#dzmodal.on{display:flex}
-#dzbox{background:var(--surf);border:1px solid var(--rule);border-radius:10px;
-  max-width:820px;width:100%;max-height:88vh;overflow:auto;padding:16px}
-#dzbox h4{margin:0 0 3px;font-size:16px}
-#dzbox .t{color:var(--dim);font-size:12px;margin-bottom:11px}
+/* The modal sat on a surface one shade off the page behind it, with an
+   undefined --dim for its subtitle and close button, so it read as part of the
+   page rather than on top of it. Now: a heavier scrim that blurs the page, a
+   lifted panel with a real shadow and accent edge, and a sticky header so the
+   close control is findable however far you scroll inside it. */
+#dzmodal{position:fixed;inset:0;background:#050807e8;display:none;z-index:50;
+  align-items:center;justify-content:center;padding:20px;
+  backdrop-filter:blur(4px) saturate(.7)}
+#dzmodal.on{display:flex;animation:dzin .14s ease-out}
+@keyframes dzin{from{opacity:0}to{opacity:1}}
+#dzbox{background:var(--surf2);border:1px solid #3b4a45;border-top:3px solid var(--acc);
+  border-radius:12px;max-width:820px;width:100%;max-height:88vh;overflow:auto;
+  padding:0 18px 18px;box-shadow:0 24px 70px #000c,0 0 0 1px #0008;
+  animation:dzup .16s ease-out}
+@keyframes dzup{from{transform:translateY(10px)}to{transform:none}}
+#dzbox h4{margin:0 0 3px;font-size:17px;letter-spacing:-.01em}
+#dzbox .t{color:var(--mut);font-size:12px;margin-bottom:11px}
 #dzbox img{width:100%;border-radius:6px;margin-bottom:9px}
-#dzclose{float:right;cursor:pointer;color:var(--dim);font-size:20px;line-height:1;
+/* keeps the title and the X visible while the body scrolls under them */
+#dzbox>h4,#dzbox>#dzclose{position:sticky;top:0;background:var(--surf2);
+  padding-top:16px;z-index:2}
+#dzclose{float:right;cursor:pointer;color:var(--mut);font-size:20px;line-height:1;
   background:none;border:0}
 .langbar{display:flex;gap:5px;margin-left:auto}
 .langbar a{font-size:11.5px;padding:4px 10px;border-radius:6px;background:var(--surf2);
@@ -531,6 +686,45 @@ h1.dt{font-size:23px;margin:0 0 5px;letter-spacing:-.02em;line-height:1.25}
 .sub{color:var(--mut);font-size:13px;margin-bottom:16px}
 .back{font-size:13px;display:inline-block;margin:16px 0 0}
 @media(max-width:900px){.det{grid-template-columns:1fr}}
+/* --- min/max range pairs --- */
+.rng{display:inline-flex;align-items:center;gap:4px;background:var(--surf2);
+  border:1px solid var(--rule);border-radius:7px;padding:3px 8px}
+.rng b{font-size:10.5px;color:var(--mut);font-weight:600;text-transform:uppercase;
+  letter-spacing:.04em;margin-right:2px;white-space:nowrap}
+.rng em{color:var(--mut);font-style:normal}
+.rng input{width:66px;padding:3px 5px;font-size:12.5px;background:var(--bg);
+  border:1px solid var(--rule);border-radius:5px;color:var(--ink)}
+/* --- closing clock --- */
+.clock{display:flex;align-items:baseline;gap:7px;margin:7px 0 2px;font-size:12px;
+  padding:4px 8px;border-radius:6px;border:1px solid var(--rule);background:var(--surf2)}
+.clock span{color:var(--mut);text-transform:uppercase;font-size:10px;letter-spacing:.05em}
+.clock b{font-family:"IBM Plex Mono",monospace;font-variant-numeric:tabular-nums;
+  font-size:13.5px;font-weight:600;color:var(--ink)}
+.clock.open{border-color:#2f4a44}
+.clock.open b{color:var(--acc)}
+.clock.urgent{border-color:var(--warn);background:#2a1f0e}
+.clock.urgent b{color:var(--warn)}
+.clock.closed{border-color:#3a2c2c;background:#221a1a}
+.clock.closed b{color:var(--mut)}
+.clock.none{opacity:.45}
+/* A closed lot is history, not a buying opportunity — mute the whole card so
+   the live ones carry the eye, but keep its final price legible. */
+.card.is-closed{opacity:.82}
+.card.is-closed .thumb img{filter:grayscale(.55)}
+.b-closed{background:#3a2c2c;color:#d6a9a2}
+/* went to auction and found no buyer — not the same as never opened */
+.b-unsold{background:#2f2a1c;color:#d9c48a}
+.v.unsold{color:var(--warn)}
+.v.final{color:var(--good);font-weight:700}
+.v.start{color:var(--ink2)}
+.v.soon{color:var(--mut);font-style:italic;font-size:14px}
+/* --- save for later --- */
+.card{position:relative}
+.save{position:absolute;top:8px;right:8px;z-index:4;width:30px;height:30px;
+  border-radius:50%;border:1px solid var(--rule);background:#0d1117cc;color:var(--mut);
+  font-size:15px;line-height:1;cursor:pointer;backdrop-filter:blur(3px);transition:.12s}
+.save:hover{color:var(--warn);border-color:var(--warn);transform:scale(1.08)}
+.save.on{color:var(--warn);border-color:var(--warn);background:#2a1f0ecc}
 </style></head><body>
 <div id="lbox"><button id="lbclose" aria-label="close">&times;</button>
   <button id="lbprev" aria-label="previous">&#8249;</button>
@@ -612,6 +806,55 @@ h1.dt{font-size:23px;margin:0 0 5px;letter-spacing:-.02em;line-height:1.25}
     }
   });
 })();
+
+// Live closing clocks. The server already rendered a correct value, so this
+// only keeps it honest while the page is open — a card left on screen through
+// a sale would otherwise still claim the lot closes in two minutes.
+(function(){
+  function fmt(s){
+    s=Math.abs(Math.floor(s));
+    var d=Math.floor(s/86400), h=Math.floor(s%86400/3600),
+        m=Math.floor(s%3600/60), x=s%60;
+    if(d) return d+'d '+String(h).padStart(2,'0')+'h';
+    if(h) return h+'h '+String(m).padStart(2,'0')+'m';
+    if(m) return m+'m '+String(x).padStart(2,'0')+'s';
+    return x+'s';
+  }
+  function tick(){
+    var now=Date.now()/1000;
+    document.querySelectorAll('.clock[data-ends]').forEach(function(el){
+      var ends=+el.dataset.ends, left=ends-now, b=el.querySelector('b'),
+          k=el.querySelector('span');
+      if(!b) return;
+      if(left>0){
+        el.className='clock open'+(left<3600?' urgent':'');
+        k.textContent='closes in'; b.textContent=fmt(left);
+      }else{
+        // Crossing zero does not reveal the hammer price — that arrives with
+        // the next scrape — so say the sale is over and leave the number be.
+        el.className='clock closed';
+        k.textContent='closed'; b.textContent=fmt(left)+' ago';
+        el.closest('.card') && el.closest('.card').classList.add('is-closed');
+      }
+    });
+  }
+  tick(); setInterval(tick,1000);
+})();
+
+// Save for later. Server-side on purpose: the shortlist has to be the same
+// list on the phone and on the desktop, which browser storage cannot do.
+(function(){
+  document.addEventListener('click',function(e){
+    var b=e.target.closest('.save'); if(!b) return;
+    e.preventDefault(); e.stopPropagation();
+    b.disabled=true;
+    fetch('/api/save?id='+encodeURIComponent(b.dataset.id),{method:'POST'})
+      .then(function(r){return r.json();})
+      .then(function(j){ b.classList.toggle('on', !!j.saved); })
+      .catch(function(){ b.title='could not save — is the server still up?'; })
+      .finally(function(){ b.disabled=false; });
+  });
+})();
 </script>
 """
 
@@ -622,9 +865,17 @@ def money(v, cls="") -> str:
     return f'<span class="v {cls}">{v:,.0f}</span>'.replace(",", " ")
 
 
-def card_html(r: dict) -> str:
+def card_html(r: dict, saved: set[str] | None = None) -> str:
+    saved = saved or set()
     badge = {"adjuge": '<span class="b b-sold">SOLD</span>',
-             "en_cours": '<span class="b b-live">LIVE</span>',
+             "non_adjuge": '<span class="b b-unsold">UNSOLD</span>',
+             # LIVE only when a bid actually exists — price_of() distinguishes
+             # a real bid from Alcopa's opening price wearing the same field.
+             "en_cours": ('<span class="b b-live">LIVE</span>'
+                          if r["price_kind"] == "live bid"
+                          else '<span class="b b-open">OPEN</span>'),
+             "termine": '<span class="b b-closed">CLOSED</span>',
+             "pending": '<span class="b b-prep">PRICE SOON</span>',
              "mise_a_prix": '<span class="b b-open">OPEN</span>',
              "estimation": '<span class="b b-open">EST</span>'}.get(r["state"], "")
     src = r.get("source") or "vpauto"
@@ -675,14 +926,60 @@ def card_html(r: dict) -> str:
         f'{r["cc"]} cc' if r["cc"] else None,
         r["fuel"] or None] if x)
 
+    # Closing clock. Rendered server-side so the card is correct with no JS,
+    # and carrying data-ends so the page can tick it live once loaded.
+    ends, now = r.get("ends_ts"), time.time()
+    expired = bool(ends and ends <= now)
+    if not ends:
+        clock = '<div class="clock none"><span>no closing time</span></div>'
+    elif expired:
+        clock = (f'<div class="clock closed" data-ends="{int(ends)}">'
+                 f'<span>closed</span><b>{fmt_left(now - ends)} ago</b></div>')
+    else:
+        urgent = " urgent" if ends - now < 3600 else ""
+        clock = (f'<div class="clock open{urgent}" data-ends="{int(ends)}">'
+                 f'<span>closes in</span><b>{fmt_left(ends - now)}</b></div>')
+    if expired:
+        badge += '<span class="b b-closed">CLOSED</span>'
+
     dv = f'{r["discount"]}%' if r["discount"] is not None else "—"
     dcls = "good" if (r["discount"] or 0) >= 25 else "acc" if r["discount"] else ""
+
+    # Three different meanings were all being rendered as an em dash:
+    # "no price published yet", "bidding in progress", and "this is what it
+    # made". A lot listed weeks early with no number is not missing data — it
+    # is a car whose sale has not opened — so say so rather than showing "—".
+    money = (f'{r["price"]:,.0f}'.replace(",", " ")
+             if r["price"] is not None else "")
+    if r["price"] is None:
+        price_k, price_v, price_c = "price", "soon", "soon"
+    elif r.get("sold_status") == "non_adjuge":
+        # It went under the hammer and found no buyer, so the number is the
+        # price it FAILED to reach. Calling that a "final price" states the
+        # opposite of what happened — 200 lots were labelled that way.
+        price_k, price_v, price_c = "unsold, asked", money, "unsold"
+    elif expired and (r["price_kind"] == "hammer" or r["state"] == "termine"):
+        price_k, price_v, price_c = "final price", money, "final"
+    elif expired:
+        # Clock has passed but nothing confirms an outcome. Say only that.
+        price_k, price_v, price_c = "last seen", money, ""
+    else:
+        price_k, price_v, price_c = r["price_kind"], money, ""
+
+    star = " on" if str(r["id"]) in saved else ""
+    save = (f'<button class="save{star}" data-id="{html.escape(str(r["id"]))}"'
+            f' title="save to check later" aria-label="save to check later">'
+            f'&#9733;</button>')
     # Alcopa publishes no cote, so that tile would always read "—". Show the
     # opening price there instead: against a live bid it is the useful number.
-    if src == "alcopa":
-        second_k = "start"
-        second_v = (f'{r["start"]:,.0f}'.replace(",", " ") if r.get("start") else "—")
-        second_c = ""
+    # The start price is what makes a closed lot readable: opening 900 -> final
+    # 2 100 is the whole story of the sale. Show it wherever there is one and
+    # no cote to compare against, not only on Alcopa lots.
+    if r.get("start") and (src == "alcopa" or not r.get("cote")):
+        second_k, second_c = "start", "start"
+        second_v = f'{r["start"]:,.0f}'.replace(",", " ")
+    elif src == "alcopa":
+        second_k, second_v, second_c = "start", "—", ""
     else:
         second_k, second_v, second_c = "vs cote", dv, dcls
     if r["margin"] is not None:
@@ -694,14 +991,17 @@ def card_html(r: dict) -> str:
         right_k, right_v, right_c = "Landed MD", \
             (f'{r["landed"]:,}'.replace(",", " ") if r["landed"] else "—"), ""
 
-    return f"""<div class="card is-{src}{' blocked' if r['blocked'] else ''}">
+    return f"""<div class="card is-{src}{' blocked' if r['blocked'] else ''}\
+{' is-closed' if expired else ''}">
  <a class="thumb" href="/lot/{r['id']}">{thumb}<div class="badges">{badge}</div></a>
+ {save}
  <div class="body">
   <div class="t"><a href="/lot/{r['id']}">{html.escape(r['title'] or '')}</a></div>
   <div class="spec">{html.escape(spec)}</div>
+  {clock}
   <div class="money">
-   <div class="mv"><div class="k">{html.escape(r['price_kind'])}</div>
-     <div class="v">{f"{r['price']:,.0f}".replace(",", " ") if r['price'] else '—'}</div></div>
+   <div class="mv"><div class="k">{html.escape(price_k)}</div>
+     <div class="v {price_c}">{price_v}</div></div>
    <div class="mv"><div class="k">{second_k}</div><div class="v {second_c}">{second_v}</div></div>
    <div class="mv"><div class="k">{right_k}</div><div class="v {right_c}">{right_v}</div></div>
    <div class="mv"><div class="k">excise</div>
@@ -721,8 +1021,34 @@ def index_html(rows: list[dict], q: dict, total: int) -> str:
             o += f'<option value="{html.escape(str(v))}"{s}>{html.escape(lab)}</option>'
         return f'<select name="{name}">{o}</select>'
 
+    def rng(base, label, step=""):
+        """One labelled min-max pair, so a range reads as one control.
+
+        Two bare number boxes side by side is what the old markup did and it
+        was unreadable — four inputs in a row with placeholders like "min EUR"
+        gave no clue which pair belonged to which quantity.
+        """
+        st = f' step="{step}"' if step else ""
+        # The pre-rename names still filter, so they must still show: otherwise
+        # a saved URL silently hides 60% of the catalogue with every box empty.
+        LEGACY = {"price_min": "minpx", "price_max": "maxpx",
+                  "discount_min": "mindisc", "margin_min": "minmargin"}
+
+        def val(key):
+            return g(key) or g(LEGACY.get(key, ""))
+
+        return (f'<span class="rng"><b>{label}</b>'
+                f'<input type="number" name="{base}_min" placeholder="min"'
+                f' value="{val(base + "_min")}"{st}>'
+                f'<em>&ndash;</em>'
+                f'<input type="number" name="{base}_max" placeholder="max"'
+                f' value="{val(base + "_max")}"{st}></span>')
+
     makes = sorted({r["make"] for r in ROWS if r["make"]})
     fuels = sorted({r["fuel"] for r in ROWS if r["fuel"]})
+    gearboxes = sorted({r["gearbox"] for r in ROWS if r.get("gearbox")})
+    bodies = sorted({r["body"] for r in ROWS if r.get("body")})
+    locations = sorted({r["location"] for r in ROWS if r.get("location")})
     ck = lambda n, lab: (f'<label class="chk"><input type="checkbox" name="{n}" value="1"'
                          f'{" checked" if g(n) == "1" else ""}>{lab}</label>')
 
@@ -742,7 +1068,8 @@ def index_html(rows: list[dict], q: dict, total: int) -> str:
     except ValueError:
         page = 1
     lo = (page - 1) * PER
-    cards = "".join(card_html(r) for r in rows[lo:lo + PER])
+    saved = saved_ids()
+    cards = "".join(card_html(r, saved) for r in rows[lo:lo + PER])
     if not rows:
         more = '<div class="empty">nothing matches those filters</div>'
     elif npages > 1:
@@ -780,12 +1107,23 @@ def index_html(rows: list[dict], q: dict, total: int) -> str:
  <input name="q" placeholder="search title&hellip;" value="{g('q')}">
  {sel('make', [(m, m) for m in makes], g('make'), 'any make')}
  {sel('fuel', [(f, f) for f in fuels], g('fuel'), 'any fuel')}
- {sel('state', [('adjuge', 'sold'), ('en_cours', 'live'), ('mise_a_prix', 'opening'),
-                ('estimation', 'estimating')], g('state'), 'any state')}
- <input type="number" name="minpx" placeholder="min &euro;" value="{g('minpx')}">
- <input type="number" name="maxpx" placeholder="max &euro;" value="{g('maxpx')}">
- <input type="number" name="mindisc" placeholder="min disc %" value="{g('mindisc')}">
- <input type="number" name="minmargin" placeholder="min margin &euro;" value="{g('minmargin')}">
+ {sel('state', [('adjuge', 'sold'), ('non_adjuge', 'unsold'), ('en_cours', 'live'),
+                ('mise_a_prix', 'opening'), ('estimation', 'estimating'),
+                ('termine', 'finished'), ('pending', 'price soon')],
+      g('state'), 'any state')}
+ {sel('gearbox', [(x, x) for x in gearboxes], g('gearbox'), 'any gearbox')}
+ {sel('body', [(x, x) for x in bodies], g('body'), 'any body')}
+ {sel('location', [(x, x) for x in locations], g('location'), 'any location')}
+ {rng('price', 'bid &euro;')}
+ {rng('landed', 'landed &euro;')}
+ {rng('year', 'year')}
+ {rng('km', 'km')}
+ {rng('cc', 'cc')}
+ {rng('power', 'hp')}
+ {rng('margin', 'MD margin &euro;')}
+ {rng('discount', 'discount %')}
+ {rng('mdprice', 'MD price &euro;')}
+ {ck('saved', '&#9733; saved only')}{ck('closed', 'closed only')}{ck('opennow', 'still open')}
  {ck('photos', 'has photos')}{ck('clean', 'no red flags')}
  {ck('excise', 'excise-clean')}{ck('md', 'has MD match')}
  {ck('exportable', 'exportable only')}{ck('docs', 'has MOT/service docs')}
@@ -912,6 +1250,21 @@ VP_EXPORT = 120.0         # 100 HT = 120 TTC, export outside the EU
 LUX_THRESHOLD_EUR = 30000.0   # 600 000 MDL luxury excise surcharge starts here
 
 
+def eq_badge(line: dict) -> str:
+    """The '=' twin of the 'i' badge: the arithmetic actually performed.
+
+    The 'i' explains what a charge IS and where the rule comes from; that is
+    not the same question as "how did you get this number from that one".
+    Lines with no arithmetic behind them — a flat fee, a line that is
+    deliberately NOT included — get no badge rather than a fake equation.
+    """
+    eq = line.get("eq")
+    if not eq:
+        return ""
+    return (f'<span class="ci eq" tabindex="0" data-info="{html.escape(eq)}">'
+            f'=</span>')
+
+
 def cost_lines(r: dict) -> tuple[list[dict], float | None]:
     """The landed-cost stack for one lot, each line with its own explanation.
 
@@ -923,6 +1276,20 @@ def cost_lines(r: dict) -> tuple[list[dict], float | None]:
     src = r.get("source") or "vpauto"
     lines: list[dict] = []
     if px is None:
+        if src != "alcopa":
+            # 956 VPauto lots (52%) have no price yet, and this returned an
+            # empty list — so the detail page rendered a "Cost to Chisinau"
+            # heading above a completely blank table, with nothing saying why.
+            # The Alcopa branch below already explained itself; this did not.
+            lines.append({
+                "k": "No starting price published yet", "v": None,
+                "info": "VPauto lists a lot before its sale opens, with no "
+                        "'Mise a prix' on the page. Nothing downstream can be "
+                        "costed without a purchase price — excise and landed "
+                        "cost both start from it. The lot is revisited "
+                        "automatically and this fills in once VPauto "
+                        "publishes a number."})
+            return lines, None
         if src == "alcopa":
             lines.append({
                 "k": "Starting price not set yet", "v": None,
@@ -949,6 +1316,10 @@ def cost_lines(r: dict) -> tuple[list[dict], float | None]:
                      f"only {pct:,.0f}" if prem > pct else "the percentage applies")
             lines.append({
                 "k": "Buyer's premium (14.40%)", "v": prem,
+                "eq": (f"max(hammer x 14.40%, {ALC_PREMIUM_MIN:,.0f} minimum)\n"
+                       f"= max({px:,.0f} x 0.1440, {ALC_PREMIUM_MIN:,.0f})\n"
+                       f"= max({pct:,.2f}, {ALC_PREMIUM_MIN:,.0f})\n"
+                       f"= {prem:,.2f} EUR"),
                 "info": "WHAT IT IS: the auction house's own commission. You "
                         "bid 3 400, you pay 3 400 to the seller AND a "
                         "percentage on top to Alcopa for running the sale. It "
@@ -1027,7 +1398,11 @@ def cost_lines(r: dict) -> tuple[list[dict], float | None]:
                               "export is due within 90 days or French VAT "
                               "becomes payable."})
 
-    goods = sum(l["v"] for l in lines)
+    # Skip the informational lines. An Alcopa lot whose fee basis could not be
+    # read carries an "Auction fees / unknown" line with v=None, and summing it
+    # raised TypeError — a 500 on the detail page of every such lot, silently,
+    # because the card grid never calls this.
+    goods = sum(l["v"] for l in lines if l["v"] is not None)
     freight = vp.SHIPPING_EUR
     lines.append({"k": "Freight FR&rarr;Chi&#537;in&#259;u", "v": freight,
                   "info": f"{freight:,.0f} EUR is an ESTIMATE, not a quote. No "
@@ -1039,6 +1414,11 @@ def cost_lines(r: dict) -> tuple[list[dict], float | None]:
 
     if r["excise"]:
         lines.append({"k": "Moldovan excise", "v": float(r["excise"]),
+                      "eq": (f"grid lookup, not a formula we can show in full:\n"
+                             f"displacement {r['cc'] or '?'} cm3\n"
+                             f"x rate for {r['fuel'] or '?'} in that band\n"
+                             f"x age coefficient (first reg {r.get('first_reg') or '?'})\n"
+                             f"= {float(r['excise']):,.2f} EUR"),
                       "info": f"Excise = displacement x rate x age coefficient, "
                               f"from the published 2026 grid. This car: "
                               f"{r['cc'] or '?'} cm3, {r['fuel'] or '?'}. "
@@ -1052,20 +1432,31 @@ def cost_lines(r: dict) -> tuple[list[dict], float | None]:
     customs_value = goods + freight
     if customs_value <= 1000:
         proc = 4.0
+        proc_eq = (f"customs value = {goods:,.0f} (goods) + {freight:,.0f} "
+                   f"(freight) = {customs_value:,.0f} EUR\n"
+                   f"{customs_value:,.0f} <= 1 000, so the flat fee applies\n"
+                   f"= 4.00 EUR")
         proc_info = ("Flat 4 EUR applies to customs values between 100 and "
                      "1 000 EUR (Anexa 2, Legea 1380/1997).")
     else:
         proc = min(customs_value * 0.004, 1800.0)
+        proc_eq = (f"customs value = {goods:,.0f} (goods) + {freight:,.0f} "
+                   f"(freight) = {customs_value:,.0f} EUR\n"
+                   f"= min({customs_value:,.0f} x 0.004, 1 800 cap)\n"
+                   f"= min({customs_value * 0.004:,.2f}, 1 800)\n"
+                   f"= {proc:,.2f} EUR")
         proc_info = (f"0.4% of the customs value ({customs_value:,.0f} EUR = "
                      f"purchase + freight), capped at 1 800 EUR. This is the "
                      "'taxa pentru proceduri vamale' and is NOT the import "
                      "duty — guides often conflate the two.")
     lines.append({"k": "Customs procedural fee (0.4%)", "v": proc,
-                  "info": proc_info})
+                  "eq": proc_eq, "info": proc_info})
 
     if customs_value > LUX_THRESHOLD_EUR:
         lux = customs_value * 0.02
         lines.append({"k": "Luxury excise surcharge (2%)", "v": lux,
+                      "eq": (f"{customs_value:,.0f} (customs value) x 2%\n"
+                             f"= {lux:,.2f} EUR"),
                       "info": "An additional excise of 2% applies above "
                               "600 000 MDL (~30 000 EUR) of customs value, "
                               "rising to 10% above 1 800 000 MDL. Shown at "
@@ -1073,7 +1464,10 @@ def cost_lines(r: dict) -> tuple[list[dict], float | None]:
     else:
         lux = 0.0
 
-    total = sum(l["v"] for l in lines)
+    # Round per line THEN sum, so the printed rows actually add up to the
+    # printed total. Summing raw floats and rounding once left the table
+    # looking like it could not do arithmetic.
+    total = sum(round(l["v"]) for l in lines if l["v"] is not None)
     lines.append({"k": "Import duty", "v": None,
                   "info": "NOT INCLUDED — unverified. EU-origin goods with an "
                           "EUR.1 certificate pay 0% under DCFTA, but a "
@@ -1173,6 +1567,7 @@ def detail_html(r: dict, fr_mode: bool = False) -> str:
     cost = "".join(
         f'<tr><td>{l["k"]}'
         f'<span class="ci" tabindex="0" data-info="{html.escape(l["info"])}">i</span>'
+        f'{eq_badge(l)}'
         f'</td><td>{"&euro;" + format(l["v"], ",.0f").replace(",", " ") if l["v"] is not None else "&mdash;"}</td></tr>'
         for l in lines)
     tot = (f'<tr class="tot"><td>Landed in Chi&#537;in&#259;u</td>'
@@ -1180,9 +1575,19 @@ def detail_html(r: dict, fr_mode: bool = False) -> str:
 
     md = ""
     if r["md_price"]:
+        # md_price and margin are INDEPENDENT: a lot can match an MD reference
+        # cell while landed cost is still unknown (no price published yet, or
+        # cc missing), leaving margin None. Assuming they arrive together
+        # killed 88 lot pages outright — the connection dropped with no
+        # response at all, which is worse than a 500 because nothing in the
+        # browser explains it. card_html already guarded this; this did not.
         mcls = "good" if (r["margin"] or 0) > 0 else "crit"
-        sign = "+" if r["margin"] >= 0 else "−"
-        marg = f'{sign}&euro;{abs(r["margin"]):,.0f}'.replace(",", " ")
+        if r["margin"] is None:
+            marg = "&mdash;"
+            mcls = ""
+        else:
+            sign = "+" if r["margin"] >= 0 else "−"
+            marg = f'{sign}&euro;{abs(r["margin"]):,.0f}'.replace(",", " ")
         md = f"""<div class="panel"><h3>Moldova resale</h3><table class="kv">
         {row("Matched cell", html.escape(r["md_cell"] or ""))}
         {row("Sold in window", f'{int(r["md_n"])} cars')}
@@ -1266,6 +1671,18 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(body)
         except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError):
             self.close_connection = True
+
+    def do_POST(self):
+        u = urllib.parse.urlparse(self.path)
+        if u.path != "/api/save":
+            self._send(b"<h1>404</h1>", code=404)
+            return
+        lot = (urllib.parse.parse_qs(u.query).get("id", [""])[0] or "").strip()
+        if not lot:
+            self._send(b'{"error":"no id"}', "application/json", 400)
+            return
+        self._send(json.dumps({"id": lot, "saved": saved_toggle(lot)}).encode(),
+                   "application/json; charset=utf-8")
 
     def do_GET(self):
         u = urllib.parse.urlparse(self.path)
