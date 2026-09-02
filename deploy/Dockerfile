@@ -16,8 +16,16 @@ RUN chmod +x /usr/local/bin/run_day
 
 # Runs as an unprivileged user; the image needs no capabilities, no
 # privileged mode and no docker-group membership on the host.
-RUN useradd -m -u 1000 runner && mkdir -p /data && chown -R runner:runner /data /app
-USER runner
+#
+# The Playwright base image ALREADY ships a uid-1000 account ("pwuser"), so
+# `useradd -m -u 1000 runner` collides with it and fails the build outright.
+# Reuse the existing uid instead of trying to create it.
+RUN mkdir -p /data && chown -R 1000:1000 /data /app
+USER 1000
+
+# Chromium needs a writable HOME for its profile and crash dumps; without one
+# it exits with an unhelpful error that looks like a sandbox problem.
+ENV HOME=/tmp
 
 # Every file this writes — watch list, captures, WAF token, debug dumps —
 # lands under ALCOPA_DATA, so one volume mounted at /data is the whole of it.

@@ -262,13 +262,31 @@ def _mint_playwright() -> str | None:
 
         try:
             page.goto(BASE + "/", timeout=60000, wait_until="domcontentloaded")
-            page.wait_for_timeout(3500)
+            # Wait for the button to EXIST rather than sleeping a guessed 3.5s.
+            try:
+                page.wait_for_selector("#amzn-captcha-verify-button", timeout=12000)
+            except Exception:                               # noqa: BLE001
+                page.wait_for_timeout(1500)                 # no button: maybe no challenge
             log(f"loaded, title={page.title()!r}")
             btn = page.query_selector("#amzn-captcha-verify-button")
             log(f"begin button: {'found' if btn else 'ABSENT'}")
             if btn:
                 btn.click()
-                page.wait_for_timeout(3000)
+                # And wait for the challenge to PAINT ITS TEXT, rather than
+                # sleeping another guessed 3s. On a cold container the JS had
+                # not run when body.innerText was read, so the instruction came
+                # back empty and the attempt aborted with "noinstruction" —
+                # the retry covered it, but it burned a whole attempt on a
+                # timing guess. Wait for the thing we actually need.
+                try:
+                    page.wait_for_function(
+                        """() => {
+                            const t = (document.body.innerText || '');
+                            return /Choose all|Choisissez tou|Selecciona|W[aä]hle|Seleziona|Kies alle/i.test(t);
+                        }""", timeout=15000)
+                    log("instruction text painted")
+                except Exception:                           # noqa: BLE001
+                    log("instruction text never appeared in 15s — trying anyway")
             # Belt and braces: match the instruction in whatever language the
             # WAF decided to serve, and never hand the model a bare "?" — a
             # blind guess wastes a solve and looks like a network failure.
