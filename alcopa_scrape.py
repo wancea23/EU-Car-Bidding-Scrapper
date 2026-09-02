@@ -85,12 +85,22 @@ def _gemini_keys() -> list[str]:
         # AI Studio key is "AIzaSy..."; a Hugging Face token ("hf_...") or an
         # OpenAI key ("sk-...") pasted here 401s on every request, on every
         # retry, on every key — and used to do so silently.
-        odd = [k for k in keys if not k.startswith("AIza")]
-        if odd:
-            print(f"  [gemini] WARNING: {len(odd)} of {len(keys)} key(s) do not "
-                  f"look like AI Studio keys (expected 'AIzaSy...', got "
-                  f"'{odd[0][:6]}...'). These will be rejected with HTTP 401.",
-                  flush=True)
+        # Flag keys that are known to belong to OTHER services, rather than
+        # demanding one blessed prefix. Requiring "AIzaSy" was wrong: AI Studio
+        # also issues "AQ.Ab8..." keys, and all seven of the working keys in
+        # the local pool are that shape — the check would have cried wolf on
+        # every valid key. Only a token that clearly belongs elsewhere is worth
+        # naming, because that one really does 401 on every request.
+        FOREIGN = {"hf_": "Hugging Face", "sk-": "OpenAI",
+                   "ghp_": "GitHub", "github_pat_": "GitHub",
+                   "xoxb-": "Slack", "AKIA": "AWS"}
+        for k in keys:
+            for pre, who in FOREIGN.items():
+                if k.startswith(pre):
+                    print(f"  [gemini] WARNING: a key starting '{k[:6]}...' is a "
+                          f"{who} token, not a Gemini one. Google will reject it "
+                          f"with HTTP 401 on every request.", flush=True)
+                    break
         return keys
     # The workstation fallback. On a server there is no LOCALAPPDATA, and the
     # bare os.environ[...] raised a KeyError that surfaced four lines later as
