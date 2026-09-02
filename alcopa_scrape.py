@@ -916,22 +916,48 @@ def cmd_watch(args) -> None:
     # sequence means a group's +90s pass blocks the next one: two sales a
     # minute apart, and the second sale's whole pre-close burst is slept
     # through and its prices lost for good.
-    schedule = sorted((end + off, end, off)
-                      for end in groups for off in offsets)
+    schedule = [(end + off, end, off) for end in groups for off in offsets]
+
+    # A SAFETY NET under the precision bursts. Those only fire where we BELIEVE
+    # a sale closes, and on 2026-09-02 that belief was hours wrong for three
+    # sales: 224 lots were watched long after they had already ended, and their
+    # prices are gone for good. A clock we read from the site can be wrong; a
+    # sweep does not care what the clock says.
+    #
+    # So: poll EVERY lot still believed open, every --sweep seconds, all day.
+    # However wrong a deadline turns out to be, the last price we hold is at
+    # most one sweep old. A full pass over 4 000 lots takes ~20s at 24 workers,
+    # so this is cheap insurance against the failure that actually happened.
+    #
+    # The offset recorded is the real distance from the believed close, so a
+    # sweep slots straight into merge's "nearest observation before the close
+    # wins" rule with no special case.
+    if args.sweep:
+        horizon_end = max(groups) + 120
+        t = time.time() + args.sweep
+        while t < horizon_end:
+            schedule.append((t, None, None))       # None end = sweep everything
+            t += args.sweep
+        print(f"plus a full sweep of every open lot every {args.sweep}s "
+              f"— a wrong deadline can now cost at most that much")
+
+    schedule = sorted(schedule, key=lambda x: x[0])
     now = time.time()
     refreshed: set[int] = set()           # sales already given their closing token
+    finished: set[str] = set()            # lots seen finished; sweeps skip them
     for at, end, off in schedule:
-        if at < now - 30 and off < -20:
+        if end is not None and at < now - 30 and off < -20:
             continue                      # that moment is already gone
         # Get the token ready BEFORE the moment, never on it. waf_token() can
         # block ~55s driving a captcha; called at the burst instant that turns
         # the T-20s and T-5s passes into T+35s ones, which read a sold lot with
         # its price already stripped. Wake early, mint in the dead time, then
         # sleep out the remainder so the burst still fires on the second.
+        label = ("sweep" if end is None else
+                 f"{time.strftime('%H:%M:%S', time.localtime(end))} T{off:+d}s")
         lead = at - MINT_LEAD - time.time()
         if lead > 0:
-            print(f"  sleeping {lead:.0f}s -> "
-                  f"{time.strftime('%H:%M:%S', time.localtime(end))} T{off:+d}s")
+            print(f"  sleeping {lead:.0f}s -> {label}")
             time.sleep(lead)
         # Minting early is not enough on its own. With a plain age threshold
         # the token happens to expire during the final approach, so the T-20s
@@ -947,7 +973,7 @@ def cmd_watch(args) -> None:
         # lots whose prices no longer exist anywhere. The captcha is a remote
         # dependency that will sometimes fail; the schedule has to outlive it.
         try:
-            if off <= -300:
+            if end is None or off <= -300:
                 waf_token(min_remaining=MINT_LEAD + 70)
             elif end not in refreshed:
                 waf_token(force=True)
@@ -955,19 +981,31 @@ def cmd_watch(args) -> None:
             else:
                 waf_token()
         except Exception as e:                              # noqa: BLE001
-            print(f"  !! no token for {time.strftime('%H:%M', time.localtime(end))} "
-                  f"T{off:+d}s ({str(e)[:60]}) — skipping this pass, "
-                  f"continuing the day")
+            print(f"  !! no token for {label} ({str(e)[:60]}) — skipping "
+                  f"this pass, continuing the day")
             continue
         wait = at - time.time()
         if wait > 0:
             time.sleep(wait)
-        urls = [r[1] for r in groups[end]]
+        if end is None:
+            # Sweep: every lot we still believe is open, plus anything that
+            # closed in the last hour (a deadline can be wrong in that
+            # direction too). Skipping lots already recorded as finished keeps
+            # the pass cheap as the day burns down.
+            members = [r for g in groups.values() for r in g
+                       if r[2] > time.time() - 3600 and r[0] not in finished]
+            if not members:
+                continue
+        else:
+            members = groups[end]
+        urls = [r[1] for r in members]
         t0 = time.time()
         with futures.ThreadPoolExecutor(max_workers=args.workers) as ex:
             recs = list(ex.map(_harvest_one, urls))
         got = 0
-        for rec, (lid, lurl, _e) in zip(recs, groups[end]):
+        for rec, (lid, lurl, _e) in zip(recs, members):
+            if rec and rec.get("sale_state") in ("adjuge", "termine"):
+                finished.add(lid)      # stop sweeping a lot that is over
             if not rec:
                 continue
             got += 1
@@ -976,7 +1014,13 @@ def cmd_watch(args) -> None:
             if args.out:
                 with open(args.out, "a", encoding="utf-8") as fh:
                     fh.write(json.dumps({
-                        "lot_id": lid, "url": lurl, "ends_ts": end, "offset": off,
+                        "lot_id": lid, "url": lurl,
+                        "ends_ts": _e if end is None else end,
+                        # On a sweep, record the REAL distance from that lot's
+                        # own believed close. merge's "nearest observation
+                        # before the close wins" rule then consumes a sweep
+                        # exactly like a scheduled pass, with no special case.
+                        "offset": (int(time.time() - _e) if end is None else off),
                         "observed_at": time.time(),
                         "price": rec.get("current_price"),
                         "state": rec.get("sale_state"),
@@ -1274,6 +1318,9 @@ def main() -> None:
     w.add_argument("--horizon", type=int, default=86400,
                    help="only lots closing within this many seconds")
     w.add_argument("--workers", type=int, default=12)
+    w.add_argument("--sweep", type=int, default=900, metavar="SECONDS",
+                   help="also poll every still-open lot this often, so a wrong "
+                        "closing time costs at most one sweep (0 disables)")
     w.add_argument("--lots", metavar="FILE",
                    help="JSON watch list [{lot_id,url,ends_ts}] instead of the DB, "
                         "so this can run where the database does not exist")
