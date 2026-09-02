@@ -81,6 +81,16 @@ def _gemini_keys() -> list[str]:
     env = os.environ.get("GEMINI_API_KEY", "")
     keys = [k.strip() for k in re.split(r"[,\s]+", env) if k.strip()]
     if keys:
+        # Catch the likelier mistake than a missing variable: a WRONG one. An
+        # AI Studio key is "AIzaSy..."; a Hugging Face token ("hf_...") or an
+        # OpenAI key ("sk-...") pasted here 401s on every request, on every
+        # retry, on every key — and used to do so silently.
+        odd = [k for k in keys if not k.startswith("AIza")]
+        if odd:
+            print(f"  [gemini] WARNING: {len(odd)} of {len(keys)} key(s) do not "
+                  f"look like AI Studio keys (expected 'AIzaSy...', got "
+                  f"'{odd[0][:6]}...'). These will be rejected with HTTP 401.",
+                  flush=True)
         return keys
     # The workstation fallback. On a server there is no LOCALAPPDATA, and the
     # bare os.environ[...] raised a KeyError that surfaced four lines later as
@@ -137,7 +147,7 @@ def _solve_grid(instruction: str, png: Path) -> list[int]:
             {"type": "image_url",
              "image_url": {"url": "data:image/png;base64," + img}}]}],
         "max_tokens": 2000}).encode()
-    for key in _gemini_keys():
+    for ki, key in enumerate(_gemini_keys(), 1):
         for attempt in range(3):
             req = urllib.request.Request(
                 GEMINI_URL, data=body,
@@ -145,8 +155,30 @@ def _solve_grid(instruction: str, png: Path) -> list[int]:
                          "Content-Type": "application/json"})
             try:
                 r = json.load(urllib.request.urlopen(req, timeout=90))
-            except Exception:
-                time.sleep(2 * (attempt + 1))  # 503s here are common and transient
+            except urllib.error.HTTPError as e:
+                # A bare `except Exception: sleep; continue` treated a 401 and
+                # a transient 503 identically and logged neither, so a
+                # permanently wrong key looked exactly like a flaky network and
+                # silently burned every retry on every key. It cost a debug
+                # round-trip on someone else's machine to find out the key was
+                # a Hugging Face token. The status code says which in one line.
+                if e.code in (401, 403):
+                    print(f"  [gemini] key {ki}: HTTP {e.code} — REJECTED. The key "
+                          f"is wrong, not flaky; retrying it cannot help. An AI "
+                          f"Studio key starts with 'AIzaSy'.", flush=True)
+                    break                     # straight to the next key
+                if e.code == 429:
+                    print(f"  [gemini] key {ki}: HTTP 429 — quota; next key",
+                          flush=True)
+                    break
+                print(f"  [gemini] key {ki}: HTTP {e.code}, retry "
+                      f"{attempt + 1}/3", flush=True)
+                time.sleep(2 * (attempt + 1))  # 5xx here are common and transient
+                continue
+            except Exception as e:            # noqa: BLE001 — network, timeouts
+                print(f"  [gemini] key {ki}: {type(e).__name__} "
+                      f"{str(e)[:70]}, retry {attempt + 1}/3", flush=True)
+                time.sleep(2 * (attempt + 1))
                 continue
             txt = (r["choices"][0]["message"].get("content") or "")
             m = re.search(r"\[[\d,\s]*\]", txt)
