@@ -1,0 +1,22 @@
+# never leave this machine
+data/*.db
+data/*.db-*
+data/*.bak_*
+data/alcopa_token.txt
+data/_captcha.png
+data/qa/
+data/photos/
+data/saved/
+*.log
+__pycache__/
+*.pyc
+
+# Windows reserved device name, created by a stray `> nul` redirect. Git
+# cannot stat it, and `git add -A` aborts on it without writing the index —
+# which looks exactly like "add did nothing".
+nul
+
+# Local working data. The watch list is rebuilt from the sale pages on every
+# run, so nothing here needs to travel to a deploy host.
+data/
+research/

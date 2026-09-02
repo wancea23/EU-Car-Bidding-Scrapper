@@ -1,0 +1,80 @@
+name: alcopa-watch
+
+# Alcopa deletes a lot's price the second it sells: the sold page keeps the
+# photos and specs but shows no number and no clock. The only chance to record
+# what a car actually made is the last seconds before its sale closes, so this
+# runs unattended in the cloud rather than on anyone's desktop.
+on:
+  schedule:
+    # rebuild the watch list once a day (sales are published days ahead)
+    - cron: "15 4 * * *"
+    # then sweep for anything closing soon. Alcopa sells 08:30-21:00 Paris
+    # time = 06:30-19:00 UTC; a run every 20 min always lands inside the
+    # -300s..+90s capture window of every closing group.
+    - cron: "*/20 6-19 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: alcopa-watch
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Chromium
+        run: |
+          pip install -r deploy/requirements.txt
+          playwright install --with-deps chromium
+
+      - name: Rebuild the watch list
+        if: github.event.schedule == '15 4 * * *' || github.event_name == 'workflow_dispatch'
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          ALCOPA_BROWSER: playwright
+          ALCOPA_DEBUG: "1"
+        run: python alcopa_scrape.py sales --horizon 1209600 --out data/watchlist.json
+
+      - name: Capture prices for lots closing now
+        if: github.event.schedule != '15 4 * * *'
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          ALCOPA_BROWSER: playwright
+          ALCOPA_DEBUG: "1"
+        run: |
+          mkdir -p prices
+          python alcopa_scrape.py watch \
+            --lots data/watchlist.json \
+            --out prices/$(date -u +%Y-%m-%d).jsonl \
+            --horizon 1500 --workers 12
+
+      - name: Keep the mint evidence when it fails
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mint-debug-${{ github.run_id }}
+          path: |
+            data/_mint_*
+            data/_captcha.png
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Commit whatever was captured
+        if: always()
+        run: |
+          git config user.name  "alcopa-watch"
+          git config user.email "actions@users.noreply.github.com"
+          git add -A data/watchlist.json prices/ 2>/dev/null || true
+          git diff --staged --quiet || git commit -m "prices: $(date -u +'%Y-%m-%d %H:%M UTC')"
+          git pull --rebase --autostash || true
+          git push || true
