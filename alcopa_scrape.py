@@ -72,9 +72,16 @@ GEMINI_MODEL = "gemini-3.6-flash"
 
 # ------------------------------------------------------------------ WAF token
 def _gemini_keys() -> list[str]:
-    env = os.environ.get("GEMINI_API_KEY")
-    if env:
-        return [env.strip()]
+    # Accept SEVERAL keys, comma or whitespace separated. The solver already
+    # walks the list and moves to the next key when one is unhappy, which is
+    # how the workstation pool survives a daily cap — but a container given a
+    # single key had no second chance. Measured load is ~112 solves a day once
+    # the 15-minute sweep is running, against 25 on a day without it, so one
+    # key is a real risk rather than a theoretical one.
+    env = os.environ.get("GEMINI_API_KEY", "")
+    keys = [k.strip() for k in re.split(r"[,\s]+", env) if k.strip()]
+    if keys:
+        return keys
     # The workstation fallback. On a server there is no LOCALAPPDATA, and the
     # bare os.environ[...] raised a KeyError that surfaced four lines later as
     # a generic "mint failed" — a missing API key looked exactly like a broken

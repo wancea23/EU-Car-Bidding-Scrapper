@@ -12,7 +12,12 @@ services:
     image: alcopa-watcher
     restart: unless-stopped       # the container reschedules itself daily
 
-    env_file: .env                # GEMINI_API_KEY=...
+    # .env holds GEMINI_API_KEY. SEVERAL keys may be given, comma
+    # separated — the solver moves to the next one when a key is
+    # capped. Measured load is ~112 captcha solves a day, so one key
+    # on a free daily quota is likely to run out mid-afternoon.
+    #   GEMINI_API_KEY=AIza...one,AIza...two,AIza...three
+    env_file: .env
     environment:
       # Only affects how log timestamps read. Scheduling is epoch-based
       # (the site's own data-ts against time.time()), so this cannot move
