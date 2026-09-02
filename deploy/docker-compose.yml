@@ -20,6 +20,9 @@ services:
       # line up with the sale times on the site.
       TZ: Europe/Paris
       # RUN_AT_UTC: "04:30"       # daily rebuild+watch start, UTC
+      # Dumps the captcha page and the model's answer into /data when a mint
+      # fails, which is the only way to tell a wrong answer from an IP ban.
+      ALCOPA_DEBUG: "1"
 
     # Headless Chromium dies on Docker's default 64MB /dev/shm in ways that
     # look random rather than like an OOM. The browser is also launched with

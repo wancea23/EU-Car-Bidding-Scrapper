@@ -686,6 +686,21 @@ h1.dt{font-size:23px;margin:0 0 5px;letter-spacing:-.02em;line-height:1.25}
 .sub{color:var(--mut);font-size:13px;margin-bottom:16px}
 .back{font-size:13px;display:inline-block;margin:16px 0 0}
 @media(max-width:900px){.det{grid-template-columns:1fr}}
+/* --- price history --- */
+.hist-head{display:flex;gap:22px;flex-wrap:wrap;margin:2px 0 12px}
+.hist-head span{display:flex;flex-direction:column}
+.hist-head b{font-family:"IBM Plex Mono",monospace;font-size:17px;font-weight:600;
+  font-variant-numeric:tabular-nums}
+.hist-head em{font-style:normal;font-size:10.5px;color:var(--mut);
+  text-transform:uppercase;letter-spacing:.05em;margin-top:1px}
+.hist-head .good b{color:var(--good)}
+.hist-head .crit b{color:var(--crit)}
+svg.hist{width:100%;height:120px;display:block;background:var(--surf2);
+  border:1px solid var(--rule);border-radius:7px}
+svg.hist polyline{fill:none;stroke:var(--acc);stroke-width:2;
+  stroke-linejoin:round;vector-effect:non-scaling-stroke}
+svg.hist polygon{fill:var(--acc);opacity:.10}
+svg.hist circle{fill:var(--acc)}
 /* --- min/max range pairs --- */
 .rng{display:inline-flex;align-items:center;gap:4px;background:var(--surf2);
   border:1px solid var(--rule);border-radius:7px;padding:3px 8px}
@@ -1250,6 +1265,79 @@ VP_EXPORT = 120.0         # 100 HT = 120 TTC, export outside the EU
 LUX_THRESHOLD_EUR = 30000.0   # 600 000 MDL luxury excise surcharge starts here
 
 
+def price_history(lot_id: str) -> list[tuple[str, float]]:
+    """Every price ever recorded for one lot, oldest first.
+
+    Read on demand rather than in build_rows(): 23 500 rows across 6 100 lots
+    is cheap to query per page and pointless to hold in memory for a grid that
+    never shows it.
+    """
+    con = sqlite3.connect(f"file:{DB}?mode=ro", uri=True)
+    try:
+        rows = con.execute(
+            "SELECT ts, price FROM price_log WHERE lot_id=? AND price IS NOT NULL "
+            "ORDER BY ts", (lot_id,)).fetchall()
+    except sqlite3.Error:
+        rows = []
+    con.close()
+    return [(r[0], float(r[1])) for r in rows]
+
+
+def history_panel(lot_id: str) -> str:
+    """A lot's price over time, drawn as a plain inline SVG.
+
+    Deliberately quiet when nothing happened: only 163 of 4 411 lots with more
+    than one observation ever changed price, so a chart on every lot would be
+    thousands of identical flat lines. A lot that never moved gets one line of
+    text saying so, which is the useful fact about it.
+    """
+    pts = price_history(lot_id)
+    if not pts:
+        return ""
+    first, last = pts[0][1], pts[-1][1]
+    lo, hi = min(p for _, p in pts), max(p for _, p in pts)
+    moved = hi != lo
+    span = f"{pts[0][0][:16]} &rarr; {pts[-1][0][:16]}"
+
+    # Format money HERE, never with a blanket .replace(",", " ") over the
+    # finished markup — that also rewrote the commas inside the SVG's own
+    # coordinate pairs. It rendered only because SVG tolerates space-separated
+    # points; one more decimal place and it would have drawn nonsense.
+    def eur(v: float) -> str:
+        return f"{v:,.0f}".replace(",", " ")
+
+    if not moved:
+        return (f'<div class="panel"><h3>Price history</h3>'
+                f'<p class="note">Unchanged at &euro;{eur(first)} across '
+                f'{len(pts)} observations ({span}). No bid has moved it.'
+                f'</p></div>')
+
+    W, H, PAD = 560, 120, 8
+    step = (W - 2 * PAD) / max(len(pts) - 1, 1)
+    rng = (hi - lo) or 1
+    xy = [(PAD + i * step, H - PAD - (p - lo) / rng * (H - 2 * PAD))
+          for i, (_, p) in enumerate(pts)]
+    line = " ".join(f"{x:.1f},{y:.1f}" for x, y in xy)
+    area = f"{xy[0][0]:.1f},{H - PAD} " + line + f" {xy[-1][0]:.1f},{H - PAD}"
+    dots = "".join(f'<circle cx="{x:.1f}" cy="{y:.1f}" r="2.5"/>' for x, y in xy)
+    delta = last - first
+    sign = "+" if delta >= 0 else "−"
+    cls = "good" if delta > 0 else "crit" if delta < 0 else ""
+
+    return (
+        f'<div class="panel"><h3>Price history</h3>'
+        f'<div class="hist-head">'
+        f'<span><b>&euro;{eur(first)}</b><em>first seen</em></span>'
+        f'<span><b>&euro;{eur(last)}</b><em>latest</em></span>'
+        f'<span class="{cls}"><b>{sign}&euro;{eur(abs(delta))}</b><em>change</em></span>'
+        f'<span><b>{len(pts)}</b><em>observations</em></span></div>'
+        f'<svg class="hist" viewBox="0 0 {W} {H}" preserveAspectRatio="none" '
+        f'role="img" aria-label="price over time">'
+        f'<polygon points="{area}"/><polyline points="{line}"/>{dots}</svg>'
+        f'<p class="note">{span} &middot; low &euro;{eur(lo)} &middot; '
+        f'high &euro;{eur(hi)}</p></div>')
+
+
 def eq_badge(line: dict) -> str:
     """The '=' twin of the 'i' badge: the arithmetic actually performed.
 
@@ -1563,6 +1651,7 @@ def detail_html(r: dict, fr_mode: bool = False) -> str:
         equip = (f'<div class="panel"><h3>Equipment &amp; options '
                  f'({len(r["equipment"])})</h3><div class="eq">{items}</div></div>')
 
+    hist = history_panel(r["id"])
     lines, total = cost_lines(r)
     cost = "".join(
         f'<tr><td>{l["k"]}'
@@ -1642,7 +1731,7 @@ def detail_html(r: dict, fr_mode: bool = False) -> str:
     Freight is an estimate, not a quote &mdash; restart with
     <span class="mono">--shipping</span> to re-price every car.</p></div>
   <div class="panel"><h3>Vehicle</h3><table class="kv">{spec}</table></div>
-  {md}{docs}{dzone}{obs}{flags}{equip}
+  {hist}{md}{docs}{dzone}{obs}{flags}{equip}
   <a class="back" href="{html.escape(r['url'] or '#')}" target="_blank" rel="noopener">
     Open on {'alcopa-auction.fr' if str(r['id']).startswith('alcopa:') else 'vpauto.fr'} &rarr;</a>
  </div></div></div>"""

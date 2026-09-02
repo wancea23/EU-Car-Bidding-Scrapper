@@ -75,7 +75,19 @@ def _gemini_keys() -> list[str]:
     env = os.environ.get("GEMINI_API_KEY")
     if env:
         return [env.strip()]
-    kf = Path(os.environ["LOCALAPPDATA"]) / "gem-pool" / "aistudio-key.txt"
+    # The workstation fallback. On a server there is no LOCALAPPDATA, and the
+    # bare os.environ[...] raised a KeyError that surfaced four lines later as
+    # a generic "mint failed" — a missing API key looked exactly like a broken
+    # captcha solver. Say which it is.
+    local = os.environ.get("LOCALAPPDATA")
+    if not local:
+        raise RuntimeError(
+            "no GEMINI_API_KEY in the environment and no local key pool "
+            "(LOCALAPPDATA unset — this is a server). Set GEMINI_API_KEY; "
+            "in Docker put it in the .env file the compose file loads.")
+    kf = Path(local) / "gem-pool" / "aistudio-key.txt"
+    if not kf.exists():
+        raise RuntimeError(f"no GEMINI_API_KEY set and no key pool at {kf}")
     return [ln.split()[0] for ln in kf.read_text().splitlines()
             if ln.strip() and not ln.strip().startswith("#")]
 
@@ -375,16 +387,26 @@ def _waf_token_locked(force: bool) -> str:
                 and _token_alive(disk):
             _tok_cache.update(tok=disk, at=TOKEN_PATH.stat().st_mtime)
             return disk
+    last_reason = ""
     for attempt in range(4):
-        tok = _mint()
+        try:
+            tok = _mint()
+        except Exception as e:                              # noqa: BLE001
+            # Carry the real cause up instead of discarding it: a missing API
+            # key, a WAF IP ban and a wrong captcha answer all used to print
+            # the same unhelpful line.
+            last_reason, tok = str(e)[:160], None
         if tok and _token_alive(tok):
             DATA.mkdir(parents=True, exist_ok=True)
             TOKEN_PATH.write_text(tok)
             _tok_cache.update(tok=tok, at=time.time())
             print(f"  [waf] token minted (attempt {attempt + 1})")
             return tok
-        print(f"  [waf] mint failed (attempt {attempt + 1})")
-    raise RuntimeError("could not mint a WAF token")
+        print(f"  [waf] mint failed (attempt {attempt + 1})"
+              f"{': ' + last_reason if last_reason else ''}", flush=True)
+    raise RuntimeError(f"could not mint a WAF token"
+                       f"{' — ' + last_reason if last_reason else ''}. "
+                       f"Run with ALCOPA_DEBUG=1 to dump the captcha page.")
 
 
 def fetch(url: str, retries: int = 2) -> str:
@@ -830,10 +852,24 @@ def _harvest_one(url: str) -> dict | None:
 
 
 def cmd_harvest(args) -> None:
-    src = DATA / "alcopa_lots.txt"
-    if not src.exists():
-        sys.exit("run `discover` first")
-    urls = [u for u in src.read_text(encoding="utf-8").split() if u]
+    if args.watchlist:
+        # The SALE PAGES are the authoritative list of what is actually in an
+        # upcoming sale; the sitemap that `discover` reads lags behind them.
+        # 1 299 cars were sitting in sales we had no row for at all — not
+        # "missing a closing time", simply absent from the site. Harvesting
+        # straight from the watch list closes that gap.
+        wl = json.loads(Path(args.watchlist).read_text(encoding="utf-8"))
+        con = con_with_extras()
+        have = {r[0] for r in con.execute(
+            "SELECT lot_id FROM lots WHERE source='alcopa'")}
+        con.close()
+        urls = [r["url"] for r in wl if r["lot_id"] not in have]
+        print(f"{len(wl)} lots in upcoming sales, {len(urls)} of them new")
+    else:
+        src = DATA / "alcopa_lots.txt"
+        if not src.exists():
+            sys.exit("run `discover` first")
+        urls = [u for u in src.read_text(encoding="utf-8").split() if u]
     if args.limit:
         urls = urls[:args.limit]
     waf_token()
@@ -1082,6 +1118,27 @@ SALE_RE = re.compile(r"/(?:vente-encheres-en-ligne|salle-de-vente-encheres)/"
                      r"[a-z0-9-]*/?(\d+)$")
 
 
+def _persist_ends(lots: dict) -> int:
+    """Push closing times into the database as soon as they are known.
+
+    The sale page is the ONLY place a room lot's clock exists — its own page
+    carries none — so a `sales` run that does not reach its final commit
+    leaves those lots permanently blank on the site.
+    """
+    if not lots or not (DATA / "vpauto.db").exists():
+        return 0
+    con = con_with_extras()
+    n = 0
+    for r in lots.values():
+        n += con.execute(
+            "UPDATE lots SET ends_ts=? WHERE lot_id=? "
+            "AND (ends_ts IS NULL OR ends_ts != ?)",
+            (r["ends_ts"], r["lot_id"], r["ends_ts"])).rowcount
+    con.commit()
+    con.close()
+    return n
+
+
 def cmd_sales(args) -> None:
     """Build the watch list from the SALE pages, not the lot pages.
 
@@ -1108,6 +1165,13 @@ def cmd_sales(args) -> None:
 
     out: dict[str, dict] = {}
     now = int(time.time())
+
+    # Read every sale's clock FIRST (one cheap request each), then walk their
+    # pages soonest-first. Crawling in url order meant a sale six days out
+    # could absorb hours of page-walking while tomorrow's sale — the one whose
+    # clock is actually needed tonight — waited behind it. Combined with the
+    # per-sale commit below, the most urgent deadlines now land first.
+    heads: list[tuple[int, str, str]] = []
     for su in sale_urls:
         try:
             first = fetch(su)
@@ -1121,6 +1185,13 @@ def cmd_sales(args) -> None:
         end = int(ts.group(1))
         if end < now - 600 or end > now + args.horizon:
             continue
+        heads.append((end, su, first))
+    heads.sort()
+    print(f"{len(heads)} sales inside the horizon, walking soonest first:",
+          ", ".join(time.strftime('%d %b %H:%M', time.localtime(h[0]))
+                    for h in heads[:6]), flush=True)
+
+    for end, su, first in heads:
         page, added = 1, 0
         while page <= args.max_pages:
             body = first if page == 1 else fetch(f"{su}?page={page}")
@@ -1148,7 +1219,15 @@ def cmd_sales(args) -> None:
                 break
             page += 1
         print(f"  {time.strftime('%Y-%m-%d %H:%M', time.localtime(end))}  "
-              f"{added:>4} lots  {su.rsplit('/', 2)[-2]}")
+              f"{added:>4} lots  {su.rsplit('/', 2)[-2]}", flush=True)
+
+        # Write THIS sale's deadlines now, not at the end of the whole crawl.
+        # Accumulating everything in memory and committing once meant a run
+        # that was slow or interrupted delivered NOTHING: one crawl ran for
+        # seven hours, found every sale, and left 4 011 lots showing "no
+        # closing time" because it never reached its final write. Per-sale
+        # commits make every completed sale useful immediately.
+        _persist_ends({k: v for k, v in out.items() if v["ends_ts"] == end})
 
     dest = Path(args.out or (DATA / "watchlist.json"))
     dest.parent.mkdir(parents=True, exist_ok=True)
@@ -1312,6 +1391,9 @@ def main() -> None:
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("discover")
     h = sub.add_parser("harvest")
+    h.add_argument("--watchlist", metavar="FILE",
+                   help="harvest the lots a sale page lists that we do not "
+                        "have yet, instead of the sitemap dump")
     h.add_argument("--limit", type=int, default=0)
     h.add_argument("--workers", type=int, default=4)
     w = sub.add_parser("watch")
