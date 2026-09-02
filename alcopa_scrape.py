@@ -1037,12 +1037,31 @@ def cmd_watch(args) -> None:
     # wins" rule with no special case.
     if args.sweep:
         horizon_end = max(groups) + 120
-        t = time.time() + args.sweep
+        # Ride the bursts' tokens. A WAF token lives 270s but a sweep uses it
+        # for ~20s, so a sweep on its own clock mints a fresh captcha solve and
+        # throws away four minutes of validity — 66 solves a day against a free
+        # tier of 20 per key. A burst has just minted one, so a sweep placed
+        # seconds after it is FREE. Only gaps with no burst nearby get a
+        # scheduled sweep of their own.
+        # Only sweep while sales are actually running. Starting at 04:30 when
+        # the first close is at 10:00 spends ~22 captcha solves on lots that
+        # cannot possibly have closed yet — and the free tier is 20 solves per
+        # key per day, so that waste alone is a whole key. Measured over a
+        # realistic day: 83 solves sweeping from 04:30, 65 bounded to the sale
+        # window, against 24 for the bursts alone.
+        #
+        # (A previous attempt slid each sweep onto the nearest burst to share
+        # its token. Measured: no saving at 900s or 1800s, because sweeps are
+        # denser than bursts. Removed rather than kept as decoration.)
+        first_close = min(groups)
+        t = max(time.time(), first_close - 3600)
+        n = 0
         while t < horizon_end:
             schedule.append((t, None, None))       # None end = sweep everything
             t += args.sweep
-        print(f"plus a full sweep of every open lot every {args.sweep}s "
-              f"— a wrong deadline can now cost at most that much")
+            n += 1
+        print(f"plus {n} sweeps of every open lot, every {args.sweep}s from an "
+              f"hour before the first close — a wrong deadline costs one sweep")
 
     schedule = sorted(schedule, key=lambda x: x[0])
     now = time.time()
@@ -1076,7 +1095,12 @@ def cmd_watch(args) -> None:
         # lots whose prices no longer exist anywhere. The captcha is a remote
         # dependency that will sometimes fail; the schedule has to outlive it.
         try:
-            if end is None or off <= -300:
+            if end is None:
+                # Sweeps take whatever token is already valid. Forcing a fresh
+                # one here is what made them expensive; being a few minutes
+                # into a token's life costs a sweep nothing.
+                waf_token()
+            elif off <= -300:
                 waf_token(min_remaining=MINT_LEAD + 70)
             elif end not in refreshed:
                 waf_token(force=True)
